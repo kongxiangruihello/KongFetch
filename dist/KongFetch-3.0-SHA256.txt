@@ -1,0 +1,2 @@
+7b2fbcc6431d927031381f3f6321bab9c1563831bfca55590a15bb9f4ae9ec51  KongFetch-3.0-Mac.dmg
+e8707a9c97ac9a46ac93dac0a43e0db2ccac415fc74b5e382db80f7ff7624047  KongFetch-3.0-Mac.zip
