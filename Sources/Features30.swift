@@ -76,6 +76,9 @@ struct OCRRecord:Codable {
     let text:String
     let pages:Int
     let limited:Bool
+    let spans:[OCRSpan]?
+    let identity:String?
+    init(path:String,modified:Date,size:Int64,text:String,pages:Int,limited:Bool,spans:[OCRSpan]?=nil,identity:String?=nil) { self.path=path;self.modified=modified;self.size=size;self.text=text;self.pages=pages;self.limited=limited;self.spans=spans;self.identity=identity }
     func isCurrent()->Bool {
         let e=Entry(URL(fileURLWithPath:path)); return FileManager.default.fileExists(atPath:path) && e.modified == modified && e.size == size
     }
@@ -95,6 +98,7 @@ final class OCRStore {
         let name=SHA256.hash(data:Data(record.path.utf8)).map { String(format:"%02x",$0) }.joined()+".json"
         try JSONEncoder().encode(record).write(to:directory.appendingPathComponent(name),options:.atomic)
     }
+    func remove(_ path:String) throws { let name=SHA256.hash(data:Data(path.utf8)).map { String(format:"%02x",$0) }.joined()+".json";let url=directory.appendingPathComponent(name);if FileManager.default.fileExists(atPath:url.path) { try FileManager.default.removeItem(at:url) } }
     func clear() throws {
         for url in (try? FileManager.default.contentsOfDirectory(at:directory,includingPropertiesForKeys:nil)) ?? [] where url.pathExtension == "json" { try FileManager.default.removeItem(at:url) }
     }
@@ -104,14 +108,24 @@ func recognizeLocalText(_ url:URL,cancelled:()->Bool,progress:(Int)->Void = { _ 
     func failure(_ message:String)->NSError { NSError(domain:"KongFetch.OCR",code:1,userInfo:[NSLocalizedDescriptionKey:message]) }
     guard !entry.directory,entry.size <= 100_000_000 else { throw failure("文件超过 100 MB 或不是普通文件") }
     let cloud=try? url.resourceValues(forKeys:[.ubiquitousItemDownloadingStatusKey]); if cloud?.ubiquitousItemDownloadingStatus == .notDownloaded { throw failure("文件尚未下载，请先在访达下载") }
-    func recognize(_ image:CGImage)throws->String {
+    var spans:[OCRSpan]=[],geometryCharacters=0
+    func recognize(_ image:CGImage,page:Int)throws->String {
         if cancelled() { throw failure("已取消") }
         let request=VNRecognizeTextRequest(); request.recognitionLevel = .accurate; request.usesLanguageCorrection=true
         let supported=try request.supportedRecognitionLanguages()
         request.recognitionLanguages=["zh-Hans","zh-Hant","en-US"].filter { supported.contains($0) }
         try VNImageRequestHandler(cgImage:image,options:[:]).perform([request])
         if cancelled() { throw failure("已取消") }
-        return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator:"\n")
+        var lines:[String]=[]
+        for observation in request.results ?? [] {
+            guard let candidate=observation.topCandidates(1).first else { continue };let string=candidate.string;lines.append(string);var glyphs:[OCRGlyph]=[]
+            if geometryCharacters < 12000,let regex=try? NSRegularExpression(pattern:"[\\p{Han}]|[^\\p{Han}\\s]+") {
+                for hit in regex.matches(in:string,range:NSRange(string.startIndex...,in:string)) {
+                    if geometryCharacters >= 12000 { break };guard let range=Range(hit.range,in:string),let observation=try? candidate.boundingBox(for:range) else { continue };let box=observation.boundingBox.intersection(CGRect(x:0,y:0,width:1,height:1));if box.isNull { continue };glyphs.append(OCRGlyph(location:hit.range.location,length:hit.range.length,x:box.minX,y:box.minY,width:box.width,height:box.height));geometryCharacters += hit.range.length
+                }
+            }
+            let box=observation.boundingBox.intersection(CGRect(x:0,y:0,width:1,height:1));if !box.isNull { spans.append(OCRSpan(page:page,text:string,x:box.minX,y:box.minY,width:box.width,height:box.height,glyphs:glyphs)) }
+        };return lines.joined(separator:"\n")
     }
     var text="",pages=0,limited=false
     if url.pathExtension.lowercased() == "pdf" {
@@ -123,11 +137,13 @@ func recognizeLocalText(_ url:URL,cancelled:()->Bool,progress:(Int)->Void = { _ 
                 guard let page=document.page(at:index) else { return }
                 let existing=page.string?.trimmingCharacters(in:.whitespacesAndNewlines) ?? ""
                 let result:String
-                if existing.count >= 20 { result=existing }
+                if existing.count >= 20 { result=existing
+                    let box=page.bounds(for:.mediaBox);if box.width > 0,box.height > 0 { spans.append(OCRSpan(page:index,text:existing,x:0,y:0,width:1,height:1,glyphs:[])) }
+                }
                 else {
                     let bounds=page.bounds(for:.mediaBox); guard bounds.width > 0,bounds.height > 0 else { return }
                     let scale=min(3,2000/max(bounds.width,bounds.height)); let image=page.thumbnail(of:NSSize(width:bounds.width*scale,height:bounds.height*scale),for:.mediaBox)
-                    guard let cg=image.cgImage(forProposedRect:nil,context:nil,hints:nil) else { return }; result=try recognize(cg)
+                    guard let cg=image.cgImage(forProposedRect:nil,context:nil,hints:nil) else { return }; result=try recognize(cg,page:index)
                 }
                 text += "\n[第 \(index+1) 页]\n"+result; pages += 1; progress(pages)
             }
@@ -135,9 +151,9 @@ func recognizeLocalText(_ url:URL,cancelled:()->Bool,progress:(Int)->Void = { _ 
         }
     } else {
         guard let source=CGImageSourceCreateWithURL(url as CFURL,nil),let image=CGImageSourceCreateThumbnailAtIndex(source,0,[kCGImageSourceCreateThumbnailFromImageAlways:true,kCGImageSourceThumbnailMaxPixelSize:2000,kCGImageSourceCreateThumbnailWithTransform:true] as CFDictionary) else { throw failure("不支持的图片格式") }
-        text=try recognize(image); pages=1; progress(1)
+        text=try recognize(image,page:0); pages=1; progress(1)
     }
-    return OCRRecord(path:url.path,modified:entry.modified ?? .distantPast,size:entry.size,text:String(text.prefix(500_000)),pages:pages,limited:limited)
+    return OCRRecord(path:url.path,modified:entry.modified ?? .distantPast,size:entry.size,text:String(text.prefix(500_000)),pages:pages,limited:limited,spans:spans,identity:fileIdentity(url))
 }
 
 struct FileUndo {
@@ -159,7 +175,7 @@ extension App {
             catch { self?.status.stringValue="撤销失败："+error.localizedDescription; throw error }
         })); if fileUndos.count > 20 { fileUndos.removeFirst() }
     }
-    @objc func renameSelected() {
+    @objc func renameSelected() { guard !fileOperationBusy else { status.stringValue="请等待当前批量操作完成";return };
         guard let url=selected?.url else { return }
         let alert=NSAlert(); alert.messageText="重命名"; alert.informativeText="保留扩展名可避免影响文件打开。操作后可通过 ⌘K 撤销。"; alert.addButton(withTitle:"重命名"); alert.addButton(withTitle:"取消")
         let field=NSTextField(string:url.lastPathComponent); field.frame=NSRect(x:0,y:0,width:360,height:28); alert.accessoryView=field
@@ -168,7 +184,7 @@ extension App {
             do { try self.moveWithUndo(url,url.deletingLastPathComponent().appendingPathComponent(name)); self.refreshAfterFileOperation(); self.status.stringValue="已重命名 · 可撤销" } catch { self.status.stringValue="重命名失败："+error.localizedDescription }
         }
     }
-    @objc func moveSelected() {
+    @objc func moveSelected() { guard !fileOperationBusy else { status.stringValue="请等待当前批量操作完成";return };
         let urls=selectedURLs; guard !urls.isEmpty else { return }; let chooser=NSOpenPanel(); chooser.title="移动到文件夹"; chooser.canChooseFiles=false; chooser.canChooseDirectories=true
         chooser.beginSheetModal(for:window) { [weak self] response in guard let self,response == .OK,let directory=chooser.url else { return }
             var count=0
@@ -177,15 +193,15 @@ extension App {
         }
     }
     func trashWithUndo(_ url:URL) throws { var result:NSURL?; try FileManager.default.trashItem(at:url,resultingItemURL:&result); if let trashed=result as URL? { fileUndos.append(FileUndo(title:"撤销移到废纸篓",reverse:{ [weak self] in do { guard !FileManager.default.fileExists(atPath:url.path) else { throw NSError(domain:"KongFetch.File",code:2,userInfo:[NSLocalizedDescriptionKey:"原位置已被占用"]) }; try FileManager.default.moveItem(at:trashed,to:url); self?.refreshAfterFileOperation(); self?.status.stringValue="已从废纸篓恢复" } catch { self?.status.stringValue="恢复失败："+error.localizedDescription; throw error } })) }; if fileUndos.count > 20 { fileUndos.removeFirst() } }
-    @objc func trashSelected() {
+    @objc func trashSelected() { guard !fileOperationBusy else { status.stringValue="请等待当前批量操作完成";return };
         let urls=selectedURLs; guard !urls.isEmpty else { return }; let alert=NSAlert(); alert.messageText="将 \(urls.count) 项移到废纸篓？"; alert.informativeText=urls.map(\.lastPathComponent).prefix(5).joined(separator:"\n")+"\n可通过 ⌘K 撤销，或从访达废纸篓恢复。"; alert.addButton(withTitle:"移到废纸篓"); alert.addButton(withTitle:"取消")
         alert.beginSheetModal(for:window) { [weak self] response in guard let self,response == .alertFirstButtonReturn else { return }; var count=0
             for url in urls { do { try self.trashWithUndo(url); count += 1 } catch { self.refreshAfterFileOperation(); self.status.stringValue="已处理 \(count) 项；其余失败："+error.localizedDescription; return } }
             if self.fileUndos.count > 20 { self.fileUndos.removeFirst(self.fileUndos.count-20) }; self.refreshAfterFileOperation(); self.status.stringValue="已移到废纸篓 · 可撤销"
         }
     }
-    @objc func undoFileOperation() { guard let item=fileUndos.popLast() else { return }; do { try item.reverse() } catch { fileUndos.append(item); status.stringValue="撤销失败，保留撤销记录："+error.localizedDescription } }
-    @objc func editFileTags() {
+    @objc func undoFileOperation() { guard !fileOperationBusy else { status.stringValue="请等待当前批量操作完成";return }; guard let item=fileUndos.popLast() else { return }; do { try item.reverse() } catch { fileUndos.append(item); status.stringValue="撤销失败，保留撤销记录："+error.localizedDescription } }
+    @objc func editFileTags() { guard !fileOperationBusy else { status.stringValue="请等待当前批量操作完成";return };
         let urls=selectedURLs; guard !urls.isEmpty else { return }
         let alert=NSAlert(); alert.messageText="添加访达标签"; alert.informativeText="多个标签用逗号分隔，将添加到原有标签。可输入颜色名称：红色、橙色、黄色、绿色、蓝色、紫色、灰色。"; alert.addButton(withTitle:"添加"); alert.addButton(withTitle:"取消")
         let field=NSTextField(string:""); field.frame=NSRect(x:0,y:0,width:360,height:28); alert.accessoryView=field
@@ -206,32 +222,15 @@ extension App {
         let panel=NSOpenPanel(); panel.title="建立本地 OCR 索引"; panel.message="选择包含图片或扫描 PDF 的文件夹。识别文字仅保存在本机，图片和 PDF 原文件不会被修改。"; panel.canChooseFiles=false; panel.canChooseDirectories=true
         panel.beginSheetModal(for:window) { [weak self] response in guard let self,response == .OK,let root=panel.url else { return }; self.startOCRIndex(root) }
     }
-    func startOCRIndex(_ root:URL) {
-        ocrQueue.cancelAllOperations(); let token=UUID(); ocrToken=token; ocrProgress="正在准备 OCR："+root.lastPathComponent
-        let exclusions=excludedRoots+[catalogStore.directory.path,ocrStore.directory.path],existing=ocrRecords,policy=ResourcePolicy(adaptive:adaptiveResources),store=ocrStore
-        let operation=BlockOperation(); operation.addExecutionBlock { [weak self,weak operation] in guard let operation else { return }
-            let catalog=scanNames([root],excluding:exclusions,throttle:{ policy.pauseIfNeeded(cancelled:{ operation.isCancelled }) },cancelled:{ operation.isCancelled }); var processed=0,skipped=0,failed=0
-            let urls=catalog.urls.filter { let e=Entry($0); return FileFilter.pdf.accepts(e) || FileFilter.images.accepts(e) }
-            for url in urls {
-                if operation.isCancelled { return }; policy.pauseIfNeeded(cancelled:{ operation.isCancelled })
-                if let record=existing[url.path],record.isCurrent() { skipped += 1; continue }
-                do { let record=try autoreleasepool { try recognizeLocalText(url,cancelled:{ operation.isCancelled }) }; if operation.isCancelled { return }; try store.save(record); processed += 1; let done=processed+skipped
-                    DispatchQueue.main.async { guard let self,self.ocrToken == token else { return }; self.ocrRecords[record.path]=record; if self.searchMode == .content,!self.search.stringValue.isEmpty { self.updateOCRMatches() }; self.ocrProgress="OCR：\(done)/\(urls.count) 项 · "+url.lastPathComponent+(record.limited ? "（前30页／长度限制）" : ""); self.status.stringValue=self.ocrProgress }
-                } catch { failed += 1; DispatchQueue.main.async { guard let self,self.ocrToken == token else { return }; self.ocrProgress="OCR 跳过："+url.lastPathComponent+" · "+error.localizedDescription } }
-            }
-            DispatchQueue.main.async { guard let self,self.ocrToken == token else { return }; self.ocrProgress="OCR 完成：新增 \(processed)，已缓存 \(skipped)，失败／未下载 \(failed)，不可访问目录 \(catalog.unreadable)"; self.status.stringValue=self.ocrProgress }
-        }; ocrQueue.addOperation(operation)
-    }
-    func loadOCRCache() {
-        let store=ocrStore; ocrQueue.addOperation { [weak self] in let saved=store.load(); DispatchQueue.main.async { guard let self else { return }; self.ocrRecords=saved.merging(self.ocrRecords,uniquingKeysWith:{ _,new in new }); if self.searchMode == .content,!self.search.stringValue.isEmpty { self.updateOCRMatches() } } }
-    }
+    func startOCRIndex(_ root:URL) { ocrManager.add(root) }
+    func loadOCRCache() { ocrManager.start() }
     func updateOCRMatches() {
         guard searchMode == .content,!showingRecent else { ocrMatches=[]; return }
-        ocrSearchQueue.cancelAllOperations(); let token=generation,records=Array(ocrRecords.values),input=SearchInput(search.stringValue,fallback:fileFilter),exclusions=excludedRoots.map { URL(fileURLWithPath:$0).resolvingSymlinksInPath().path },roots=expandedRoots(activeSearchRoots).map { $0.resolvingSymlinksInPath().path }
+        ocrSearchQueue.cancelAllOperations(); let token=generation,records=Array(ocrRecords.values),input=SearchInput(search.stringValue,fallback:fileFilter),exclusions=excludedRoots.map { canonicalIndexPath(URL(fileURLWithPath:$0).resolvingSymlinksInPath()) },roots=expandedRoots(activeSearchRoots).map { canonicalIndexPath($0.resolvingSymlinksInPath()) }
         let operation=BlockOperation(); operation.addExecutionBlock { [weak self,weak operation] in
             guard let operation else { return }; var matches:[Entry]=[]
             for record in records {
-                if operation.isCancelled { return }; let url=URL(fileURLWithPath:record.path),path=url.resolvingSymlinksInPath().path
+                if operation.isCancelled { return }; let url=URL(fileURLWithPath:record.path),path=canonicalIndexPath(url.resolvingSymlinksInPath())
                 guard record.isCurrent(),!exclusions.contains(where:{ path == $0 || path.hasPrefix($0+"/") }),roots.contains(where:{ path == $0 || path.hasPrefix($0+"/") }) else { continue }
                 let text=record.text.folding(options:[.caseInsensitive,.diacriticInsensitive,.widthInsensitive],locale:Locale(identifier:"en_US_POSIX"))
                 let compact=text.filter { !$0.isWhitespace }; if input.words.allSatisfy({ text.contains(normalized($0)) || compact.contains(normalized($0).filter { !$0.isWhitespace }) }) { matches.append(Entry(url)) }
@@ -239,16 +238,13 @@ extension App {
             DispatchQueue.main.async { guard let self,!operation.isCancelled,self.generation == token,self.searchMode == .content else { return }; self.ocrMatches=matches; for e in matches { if let record=self.ocrRecords[e.url.path] { self.snippets[e.url.path]="本地 OCR · "+excerptText(record.text,words:input.words,allowWhitespace:true) } }; self.renderSearchResults() }
         }; ocrSearchQueue.addOperation(operation)
     }
-    @objc func cancelOCR() { ocrToken=UUID(); ocrQueue.cancelAllOperations(); ocrProgress="OCR 已取消，已完成的索引保留"; status.stringValue=ocrProgress }
-    @objc func clearOCRCache() {
-        cancelOCR(); let token=ocrToken,store=ocrStore
-        ocrQueue.addOperation { [weak self] in do { try store.clear(); DispatchQueue.main.async { guard let self,self.ocrToken == token else { return }; self.ocrRecords=[:]; self.ocrMatches=[]; self.renderSearchResults(); self.status.stringValue="已清除本地 OCR 文字缓存，原文件保留" } } catch { DispatchQueue.main.async { self?.status.stringValue="OCR 缓存清除失败："+error.localizedDescription } } }
-    }
+    @objc func cancelOCR() { ocrManager.cancel();ocrProgress=ocrManager.summary;status.stringValue=ocrProgress }
+    @objc func clearOCRCache() { ocrManager.clear();ocrRecords=[:];ocrMatches=[];status.stringValue="已清除 OCR 文字缓存，原文件保留；目录已暂停自动识别" }
     @objc func resourceStatus() {
         let policy=ResourcePolicy(adaptive:adaptiveResources); var usage=rusage(); getrusage(RUSAGE_SELF,&usage)
         let cpu=Double(usage.ru_utime.tv_sec+usage.ru_stime.tv_sec)+Double(usage.ru_utime.tv_usec+usage.ru_stime.tv_usec)/1e6
         let hasSample=lastResourceTime != 0; let now=ProcessInfo.processInfo.systemUptime; let percent=lastResourceTime == 0 ? 0 : max(0,(cpu-lastResourceCPU)/(now-lastResourceTime)*100); lastResourceTime=now; lastResourceCPU=cpu
-        let alert=NSAlert(); alert.messageText="后台索引与资源"; alert.informativeText="运行策略："+(adaptiveResources ? "自动节能" : "标准速度")+"\n减速原因："+(policy.reasons().isEmpty ? "无" : policy.reasons().joined(separator:"、"))+"\n本次 CPU 采样："+(!hasSample ? "首次打开，稍后刷新查看" : String(format:"%.1f%%（单核为100%%）",percent))+"\n峰值内存："+ByteCountFormatter.string(fromByteCount:Int64(usage.ru_maxrss),countStyle:.memory)+"\n名称索引：\n"+indexSummary+"\n名称队列：\(catalogQueue.operationCount) · OCR 队列：\(ocrQueue.operationCount)\n"+ocrProgress
+        let alert=NSAlert(); alert.messageText="后台索引与资源"; alert.informativeText="运行策略："+(adaptiveResources ? "自动节能" : "标准速度")+"\n减速原因："+(policy.reasons().isEmpty ? "无" : policy.reasons().joined(separator:"、"))+"\n本次 CPU 采样："+(!hasSample ? "首次打开，稍后刷新查看" : String(format:"%.1f%%（单核为100%%）",percent))+"\n峰值内存："+ByteCountFormatter.string(fromByteCount:Int64(usage.ru_maxrss),countStyle:.memory)+"\n名称索引：\n"+indexSummary+"\n名称队列：\(catalogQueue.operationCount) · OCR 队列：\(ocrManager.queue.operationCount)\n"+ocrProgress
         alert.addButton(withTitle:adaptiveResources ? "关闭自动节能" : "启用自动节能"); alert.addButton(withTitle:"关闭"); alert.addButton(withTitle:"刷新")
         alert.beginSheetModal(for:window) { [weak self] response in guard let self else { return }; if response == .alertFirstButtonReturn { self.preferences.set(!self.adaptiveResources,forKey:"adaptiveResources"); self.status.stringValue="索引策略已更新，将在下一次扫描应用" }; if response.rawValue == 1002 { self.resourceStatus() } }
     }

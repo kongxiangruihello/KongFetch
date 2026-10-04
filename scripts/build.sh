@@ -5,7 +5,7 @@ build_root="$repo_root/build"
 app="$build_root/KongFetch.app"
 mkdir -p "$build_root" "$app/Contents/MacOS" "$app/Contents/Resources"
 for arch in arm64 x86_64; do
-  xcrun swiftc "$repo_root/Sources/main.swift" "$repo_root/Sources/Features30.swift" \
+  xcrun swiftc "$repo_root/Sources/main.swift" "$repo_root/Sources/Features30.swift" "$repo_root/Sources/Features31.swift" \
     -o "$build_root/KongFetch-$arch" -target "$arch-apple-macosx13.0" \
     -framework Cocoa -framework Quartz -framework Carbon \
     -framework ServiceManagement -framework UniformTypeIdentifiers \

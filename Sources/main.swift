@@ -154,8 +154,8 @@ func highlightedName(_ text:String,words:[String])->NSAttributedString {
     }
     return result
 }
-func rankEntries(_ entries:[Entry], words:[String], counts:[String:Int],preferredPath:String?=nil,manualPath:String?=nil,aliasPath:String?=nil)->[Entry] {
-    let scored=entries.compactMap { e -> (Entry,Int)? in guard let score=(e.url.path == aliasPath || e.url.path == manualPath ? 3000*max(1,words.count) : filenameScore(e.url,words:words)) else { return nil }; return (e,score) }
+func rankEntries(_ entries:[Entry], words:[String], counts:[String:Int],preferredPath:String?=nil,manualPath:String?=nil,aliasPath:String?=nil,scoreProvider:((URL,[String])->Int?)?=nil)->[Entry] {
+    let scored=entries.compactMap { e -> (Entry,Int)? in guard let score=(e.url.path == aliasPath || e.url.path == manualPath ? 3000*max(1,words.count) : (scoreProvider?(e.url,words) ?? (scoreProvider == nil ? filenameScore(e.url,words:words) : nil))) else { return nil }; return (e,score) }
     return scored.sorted { a,b in
         if (a.0.url.path == manualPath) != (b.0.url.path == manualPath) { return a.0.url.path == manualPath }
         if a.1 != b.1 { return a.1 > b.1 }
@@ -214,7 +214,7 @@ func scanNames(_ roots:[URL],maximum:Int=Int.max,excluding:[String]=[],progress:
 
 func canonicalIndexPath(_ url:URL)->String {
     let path=url.standardizedFileURL.path
-    return path == "/tmp" ? "/private/tmp" : (path.hasPrefix("/tmp/") ? "/private"+path : path)
+    return ["/tmp","/var"].contains(path) || path.hasPrefix("/tmp/") || path.hasPrefix("/var/") ? "/private"+path : path
 }
 func updateCatalog(_ original:CatalogResult,paths:[String],roots:[URL],excluding:[String],throttle:()->Void = {},cancelled:()->Bool)->CatalogResult {
     let canonicalRoots=roots.map { canonicalIndexPath($0.resolvingSymlinksInPath()) }; let canonicalExclusions=excluding.map { canonicalIndexPath(URL(fileURLWithPath:$0).resolvingSymlinksInPath()) }
@@ -450,6 +450,8 @@ final class ShortcutField: NSTextField {
     var record: ((NSEvent) -> Void)?
     override func keyDown(with event: NSEvent) { record?(event) }
     override var acceptsFirstResponder: Bool { true }
+    override func becomeFirstResponder()->Bool { true }
+    override func resignFirstResponder()->Bool { true }
     override func mouseDown(with event: NSEvent) { window?.makeFirstResponder(self); stringValue = "请按下组合键…" }
 }
 final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSWindowDelegate, NSMenuDelegate {
@@ -483,6 +485,26 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
     let scopePicker=NSPopUpButton()
     let searchModePicker=NSPopUpButton()
     var searchMode:SearchMode = .filename
+    var precision:SearchPrecision { get { SearchPrecision(rawValue:preferences.object(forKey:"searchPrecision") as? Int ?? 1) ?? .fuzzyName } set { preferences.set(newValue.rawValue,forKey:"searchPrecision") } }
+    var managerStarted=false
+    lazy var ocrManager:OCRManager = { managerStarted=true;return OCRManager(store:ocrStore,preferences:preferences,excludes:{ [weak self] in self?.excludedRoots ?? [] },adaptive:{ [weak self] in self?.adaptiveResources ?? true },changed:{ [weak self] records,summary in guard let self else { return };self.ocrRecords=records;self.ocrProgress=summary;if self.searchMode == .content,!self.search.stringValue.isEmpty { self.updateOCRMatches() } }) }()
+    var ocrController:OCRPanelController?
+    var archiveController:ArchiveSearchController?
+    var batchController:BatchRenameController?
+    var shortcutController:OperationShortcutController?
+    let ocrImageView=OCRImageView()
+    var ocrPositions:[(Int,CGRect)]=[]
+    var operationHotKeys:[UInt32:EventHotKeyRef]=[:]
+    var operationTargets:[UInt32:OperationCommand]=[:]
+    var operationShortcutErrors:[String]=[]
+    var operationRecorder:((OperationBinding)->Void)?
+    let fileOperationQueue:OperationQueue = { let q=OperationQueue();q.maxConcurrentOperationCount=1;q.qualityOfService = .userInitiated;return q }()
+    var fileOperationBusy=false
+    var updateDownload:UpdateDownload?
+    var checkingUpdate=false
+    var updateTask:URLSessionDataTask?
+    var updateStatusController:UpdateStatusController?
+
     let catalogQueue:OperationQueue = { let q=OperationQueue(); q.maxConcurrentOperationCount=1; q.qualityOfService = .utility; return q }()
     var catalogCache:[String:(Date,CatalogResult)]=[:]
     var validatedCatalogs=Set<String>()
@@ -494,7 +516,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
     var qaSuite:String?
     var savedSearches:[[String:Any]] { preferences.array(forKey:"savedSearches") as? [[String:Any]] ?? [] }
     func captureSearch(_ name:String)->[String:Any] {
-        return ["name":name,"query":search.stringValue,"all":scopeAll,"folder":folder.path,"roots":activeSearchRoots,"filter":fileFilter.rawValue,"dateFilter":dateFilter,"sizeFilter":sizeFilter,"dateField":dateField,"customStart":customStart,"customEnd":customEnd,"searchMode":searchMode.rawValue]
+        return ["name":name,"query":search.stringValue,"all":scopeAll,"folder":folder.path,"roots":activeSearchRoots,"filter":fileFilter.rawValue,"dateFilter":dateFilter,"sizeFilter":sizeFilter,"dateField":dateField,"customStart":customStart,"customEnd":customEnd,"searchPrecision":precision.rawValue,"searchMode":searchMode.rawValue]
     }
     func applySavedSearch(_ item:[String:Any]) {
         let all=item["all"] as? Bool ?? true; let target=URL(fileURLWithPath:item["folder"] as? String ?? NSHomeDirectory())
@@ -504,7 +526,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         if scopeAll { scopePicker.selectItem(at:0) } else { if scopePicker.numberOfItems > 7 { scopePicker.removeItem(at:7) }; scopePicker.addItem(withTitle:"文件夹："+folder.lastPathComponent); scopePicker.selectItem(at:7) }
         fileFilter=FileFilter(rawValue:item["filter"] as? Int ?? 0) ?? .all; filterPicker.selectItem(at:fileFilter.rawValue)
         dateFilter=min(4,max(0,item["dateFilter"] as? Int ?? 0)); sizeFilter=min(3,max(0,item["sizeFilter"] as? Int ?? 0)); dateField=min(1,max(0,item["dateField"] as? Int ?? 0)); customStart=item["customStart"] as? Date ?? Date(); customEnd=item["customEnd"] as? Date ?? Date()
-        searchMode=SearchMode(rawValue:item["searchMode"] as? Int ?? 0) ?? .filename; updateSearchModeUI(); updateFilterSummary(); search.stringValue=item["query"] as? String ?? ""; startSearch(); saveState()
+        precision=SearchPrecision(rawValue:item["searchPrecision"] as? Int ?? precision.rawValue) ?? .fuzzyName;searchMode=SearchMode(rawValue:item["searchMode"] as? Int ?? 0) ?? .filename; updateSearchModeUI(); updateFilterSummary(); search.stringValue=item["query"] as? String ?? ""; startSearch(); saveState()
     }
     @objc func saveCurrentSearch() {
         let alert=NSAlert(); alert.messageText="保存常用搜索"; alert.informativeText="保存关键词、范围、搜索模式和筛选条件。同名搜索会更新。"; alert.addButton(withTitle:"保存"); alert.addButton(withTitle:"取消")
@@ -655,7 +677,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         let roots=excludedRoots; let alert=NSAlert(); alert.messageText="排除搜索目录"; alert.informativeText="这些目录及其子目录不会出现在搜索结果中。设置后重新核对索引。默认跳过隐藏文件、缓存和开发依赖目录。"; for title in ["完成","添加目录…","移除所选"] { alert.addButton(withTitle:title) }; let picker=NSPopUpButton(); picker.addItems(withTitles:roots.isEmpty ? ["尚无自定义排除目录"] : roots); picker.frame=NSRect(x:0,y:0,width:460,height:30); alert.accessoryView=picker
         alert.beginSheetModal(for:window) { [weak self] result in guard let self else { return }; if result == .alertSecondButtonReturn { let panel=NSOpenPanel(); panel.canChooseFiles=false; panel.canChooseDirectories=true; panel.allowsMultipleSelection=true; panel.prompt="排除此目录"; panel.beginSheetModal(for:self.window) { result in if result == .OK { self.preferences.set(Array(Set(self.excludedRoots+panel.urls.map { $0.resolvingSymlinksInPath().path })).sorted(),forKey:"excludedSearchRoots"); self.resetCatalogsForExclusions() }; self.manageExcludedDirectories() } } else if result.rawValue == 1002,!roots.isEmpty { var updated=roots; updated.remove(at:picker.indexOfSelectedItem); self.preferences.set(updated,forKey:"excludedSearchRoots"); self.resetCatalogsForExclusions(); self.manageExcludedDirectories() } }
     }
-    let backupKeys=["keyCode","modifiers","shortcutLabel","sortMode","workspaceState","extraSearchRoots","excludedSearchRoots","savedSearches","searchChoices","searchAliases","pinnedPaths","pinBookmarks","recordsRecentSearches","recentSearches","doubleControlWake","directoryShortcuts","rejectedResults","tagFilter","adaptiveResources"]
+    let backupKeys=["keyCode","modifiers","shortcutLabel","sortMode","workspaceState","extraSearchRoots","excludedSearchRoots","savedSearches","searchChoices","searchAliases","pinnedPaths","pinBookmarks","recordsRecentSearches","recentSearches","doubleControlWake","directoryShortcuts","rejectedResults","tagFilter","adaptiveResources","searchPrecision","ocrDirectories","ocrPaused","operationShortcuts"]
     func settingsBackupData() throws -> Data {
         saveState(); var settings:[String:Any]=[:]; for key in backupKeys { settings[key]=preferences.object(forKey:key) }
         let packet:[String:Any]=["version":1,"home":NSHomeDirectory(),"host":ProcessInfo.processInfo.hostName,"settings":settings]
@@ -672,6 +694,10 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
                 return path.hasPrefix("/") && (0...127).contains(code) && mods > 0 && mods <= Int(cmdKey|optionKey|shiftKey|controlKey) && mods & ~Int(cmdKey|optionKey|shiftKey|controlKey) == 0
             }) else { throw fail("目录快捷键设置无效") }
         }
+        if let value=settings["searchPrecision"] { guard let raw=value as? Int,(0...2).contains(raw) else { throw fail("搜索精度设置无效") } }
+        if let value=settings["ocrPaused"],!(value is Bool) { throw fail("OCR 暂停设置无效") }
+        if let value=settings["ocrDirectories"] { guard let items=value as? [[String:Any]],items.count <= 100,items.allSatisfy({ ($0["path"] as? String)?.hasPrefix("/") == true }) else { throw fail("OCR 目录设置无效") } }
+        if let value=settings["operationShortcuts"] { guard let data=value as? Data,let items=try? JSONDecoder().decode([OperationBinding].self,from:data),items.count <= OperationCommand.allCases.count,Set(items.map(\.command)).count == items.count,items.allSatisfy({ $0.valid }) else { throw fail("操作快捷键无效") } }
         if let value=settings["rejectedResults"] { guard let items=value as? [String:[String]],items.count <= 300,items.values.allSatisfy({ $0.count <= 100 && $0.allSatisfy { $0.hasPrefix("/") } }) else { throw fail("搜索反馈设置无效") } }
         if let value=settings["doubleControlWake"],!(value is Bool) { throw fail("Control 唤起设置无效") }
         if let value=settings["adaptiveResources"],!(value is Bool) { throw fail("索引策略设置无效") }
@@ -702,7 +728,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         recentSearchTimer?.invalidate(); stopQuery(); stopWatching()
         for key in backupKeys { preferences.removeObject(forKey:key) }; for (key,value) in settings { preferences.set(value,forKey:key) }
         if !shortcutOK { for (key,value) in oldShortcut { preferences.set(value,forKey:key) } }
-        registerDirectoryShortcuts(); configureControlWake(); tagFilter=preferences.string(forKey:"tagFilter") ?? ""; extraRoots=preferences.stringArray(forKey:"extraSearchRoots") ?? []; pinnedPaths=preferences.stringArray(forKey:"pinnedPaths") ?? []; pinBookmarks=preferences.dictionary(forKey:"pinBookmarks") as? [String:Data] ?? [:]; resolveSearchTargets(all:true)
+        registerDirectoryShortcuts(); registerOperationShortcuts(); if managerStarted { ocrManager.resolveRoots();ocrManager.setPaused(preferences.bool(forKey:"ocrPaused"));for root in ocrManager.roots { ocrManager.scan(root) } }; configureControlWake(); tagFilter=preferences.string(forKey:"tagFilter") ?? ""; extraRoots=preferences.stringArray(forKey:"extraSearchRoots") ?? []; pinnedPaths=preferences.stringArray(forKey:"pinnedPaths") ?? []; pinBookmarks=preferences.dictionary(forKey:"pinBookmarks") as? [String:Data] ?? [:]; resolveSearchTargets(all:true)
         catalogCache.removeAll(); validatedCatalogs.removeAll(); directorySnapshots.removeAll(); directoryRepairQueue.cancelAllOperations()
         var state=preferences.dictionary(forKey:"workspaceState")
         if let path=state?["folder"] as? String,!FileManager.default.fileExists(atPath:path) { state?["all"]=true; state?["roots"]=[NSHomeDirectory(),"/Applications"] }
@@ -851,7 +877,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
                 if !self.search.stringValue.isEmpty && self.searchMode == .filename && self.localCollection == nil {
                     let input=SearchInput(self.search.stringValue,fallback:self.fileFilter),currentRoots=self.expandedRoots(self.activeSearchRoots)
                     self.localMatches.removeAll { canonicalIndexPath($0.url).hasPrefix(prefix+"/") }
-                    self.localMatches += result.urls.filter { url in let path=canonicalIndexPath(url); return currentRoots.contains { path.hasPrefix(canonicalIndexPath($0)+"/") } && filenameScore(url,words:input.words) != nil }.map(Entry.init)
+                    self.localMatches += result.urls.filter { url in let path=canonicalIndexPath(url); return currentRoots.contains { path.hasPrefix(canonicalIndexPath($0)+"/") } && self.precision.score(url,words:input.words) != nil }.map(Entry.init)
                     self.renderSearchResults()
                 }
             }
@@ -994,7 +1020,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
     var scopeAll = false
     let dateFormat: DateFormatter = { let d = DateFormatter(); d.dateStyle = .medium; d.timeStyle = .short; return d }()
     func applicationDidFinishLaunching(_ notification: Notification) {
-        if CommandLine.arguments.contains("--smoke-test") { UserDefaults.standard.register(defaults:["NSApplicationCrashOnExceptions":true]) }
+        if CommandLine.arguments.contains(where:{$0.hasSuffix("-check") || $0 == "--smoke-test"}) { setbuf(stdout,nil);UserDefaults.standard.register(defaults:["NSApplicationCrashOnExceptions":true]) }
         let storedState=preferences.dictionary(forKey:"workspaceState")
         buildMenus(); buildWindow(); buildStatusItem()
         if !CommandLine.arguments.contains(where: { $0.hasPrefix("--") }) { configureControlWake(); tagFilter=preferences.string(forKey:"tagFilter") ?? ""; loadOCRCache() }
@@ -1003,7 +1029,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
             guard let context else { return noErr }
             let app = Unmanaged<App>.fromOpaque(context).takeUnretainedValue()
             var hotID=EventHotKeyID(); GetEventParameter(event,UInt32(kEventParamDirectObject),UInt32(typeEventHotKeyID),nil,MemoryLayout<EventHotKeyID>.size,nil,&hotID)
-            DispatchQueue.main.async { if hotID.id >= 100,let url=app.directoryTargets[hotID.id] { if FileManager.default.fileExists(atPath:url.path) { app.browse(url); app.show() } else { app.show(); app.status.stringValue="快捷目录已不存在，请重新设置" } } else { app.show() } }
+            guard hotID.signature == 0x4B464554 else { return noErr };DispatchQueue.main.async { if let recorder=app.operationRecorder { if let command=app.operationTargets[hotID.id],let item=app.operationBindings.first(where:{$0.command == command}) {recorder(item)} else if hotID.id == 1 {recorder(OperationBinding(command:.focus,code:app.preferences.object(forKey:"keyCode") as? Int ?? 49,mods:app.preferences.object(forKey:"modifiers") as? Int ?? Int(cmdKey|optionKey),label:app.preferences.string(forKey:"shortcutLabel") ?? "⌘⌥空格",global:true,enabled:true))} else if hotID.id >= 100,hotID.id < 2000,app.directoryShortcuts.indices.contains(Int(hotID.id)-100) {let item=app.directoryShortcuts[Int(hotID.id)-100];recorder(OperationBinding(command:.focus,code:item["code"] as? Int ?? 0,mods:item["mods"] as? Int ?? 0,label:item["label"] as? String ?? "",global:true,enabled:true))};return };if let command=app.operationTargets[hotID.id] { app.performOperation(command,global:true) } else if hotID.id >= 100,let url=app.directoryTargets[hotID.id] { if FileManager.default.fileExists(atPath:url.path) { app.browse(url); app.show() } else { app.show(); app.status.stringValue="快捷目录已不存在，请重新设置" } } else { app.show() } }
             return noErr
         }, 1, &type, Unmanaged.passUnretained(self).toOpaque(), &eventHandler)
         _ = register(code: UInt32(UserDefaults.standard.object(forKey: "keyCode") as? Int ?? 49), modifiers: UInt32(UserDefaults.standard.object(forKey: "modifiers") as? Int ?? (cmdKey | optionKey)))
@@ -1021,6 +1047,8 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
             for i in 0..<500 { try! Data([1]).write(to:fixture.appendingPathComponent("sample-\(i).txt")) }
             restoringState=true; catalogStore=CatalogStore(fixture.appendingPathComponent(".indexes")); scopeAll=false; folder=fixture; fileFilter = .all; filterPicker.selectItem(at:0); dateFilter=0; sizeFilter=0; searchMode = .filename; search.stringValue="sample-0"; startSearch(); show(); return
         }
+        if CommandLine.arguments.contains("--release31-check") { release31Check(); return }
+        if CommandLine.arguments.contains("--release31-ui-check") { release31UI(); return }
         if CommandLine.arguments.contains("--release30-check") { release30Check(); return }
         if CommandLine.arguments.contains("--next-check") { nextCheck(); return }
         if CommandLine.arguments.contains("--upgrade-check") { upgradeCheck(); return }
@@ -1037,7 +1065,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         }
         if CommandLine.arguments.contains("--preview-check") { previewCheck(); return }
         NotificationCenter.default.addObserver(self,selector:#selector(refreshLoginStatus),name:NSApplication.didBecomeActiveNotification,object:nil)
-        extraRoots=preferences.stringArray(forKey:"extraSearchRoots") ?? []; resolveSearchTargets(all:true); registerDirectoryShortcuts(); restoreState(storedState); show()
+        extraRoots=preferences.stringArray(forKey:"extraSearchRoots") ?? []; resolveSearchTargets(all:true); registerDirectoryShortcuts(); registerOperationShortcuts(); restoreState(storedState); show(); reportLastUpdate()
     }
     func upgradeCheck() {
         let fixture=URL(fileURLWithPath:"/tmp/kongfetch27-"+UUID().uuidString); previewFixture=fixture; try! FileManager.default.createDirectory(at:fixture,withIntermediateDirectories:true)
@@ -1237,7 +1265,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
             precondition(!query!.predicate!.evaluate(with:nonmatching)); stopQuery()
             for filter in FileFilter.allCases { fileFilter=filter; search.stringValue="正文 关键词"; startSearch(); precondition(query!.isStarted); stopQuery() }
             fileFilter = .all; saveState(); let modeState=preferences.dictionary(forKey:"workspaceState")!
-            searchMode = .filename; restoreState(modeState); precondition(searchMode == .content && searchModePicker.indexOfSelectedItem == 1)
+            searchMode = .filename; restoreState(modeState); precondition(searchMode == .content && searchModePicker.indexOfSelectedItem == 3)
             searchMode = .filename; updateSearchModeUI()
             precondition(excerptText("Prefix alpha suffix",words:["ALPHA"]).contains("alpha"))
             precondition(matchRanges("café ALPHA alpha",words:["cafe","alpha"]).count == 3)
@@ -1351,9 +1379,9 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         if let cell=search.cell as? NSSearchFieldCell { cell.searchButtonCell=nil; cell.backgroundColor = .clear }
         mount(search,in:top)
         let info=button("ⓘ",#selector(about)); info.isBordered=false; info.font = .systemFont(ofSize:22); mount(info,in:top)
-        searchModePicker.addItems(withTitles:["文件名","文件内容"]); searchModePicker.target=self; searchModePicker.action = #selector(changeSearchMode); searchModePicker.font = .systemFont(ofSize:14); searchModePicker.toolTip="文件内容搜索 Spotlight 正文及本地 OCR 索引；可从 ⌘K 为扫描 PDF 和图片建立 OCR 索引。"; mount(searchModePicker,in:top)
+        searchModePicker.addItems(withTitles:["名称：精确","名称：模糊","名称及路径","文件内容"]); searchModePicker.target=self; searchModePicker.action = #selector(changeSearchMode); searchModePicker.font = .systemFont(ofSize:14); searchModePicker.toolTip="文件内容搜索 Spotlight 正文及本地 OCR 索引；可从 ⌘K 为扫描 PDF 和图片建立 OCR 索引。"; mount(searchModePicker,in:top)
         scopePicker.removeAllItems(); scopePicker.addItems(withTitles:["全用户文件","全用户与应用程序","桌面","文稿","下载","图片","选择文件夹…"]); scopePicker.target=self; scopePicker.action = #selector(changeScope(_:)); scopePicker.font = .systemFont(ofSize:13); mount(scopePicker,in:top)
-        NSLayoutConstraint.activate([top.topAnchor.constraint(equalTo:root.topAnchor),top.leadingAnchor.constraint(equalTo:root.leadingAnchor),top.trailingAnchor.constraint(equalTo:root.trailingAnchor),top.heightAnchor.constraint(equalToConstant:56),back.leadingAnchor.constraint(equalTo:top.leadingAnchor,constant:16),back.centerYAnchor.constraint(equalTo:top.centerYAnchor),back.widthAnchor.constraint(equalToConstant:38),search.leadingAnchor.constraint(equalTo:back.trailingAnchor,constant:8),search.centerYAnchor.constraint(equalTo:top.centerYAnchor),search.trailingAnchor.constraint(equalTo:info.leadingAnchor,constant:-14),search.heightAnchor.constraint(equalToConstant:26),info.widthAnchor.constraint(equalToConstant:32),info.centerYAnchor.constraint(equalTo:top.centerYAnchor),searchModePicker.leadingAnchor.constraint(equalTo:info.trailingAnchor,constant:12),searchModePicker.widthAnchor.constraint(equalToConstant:95),searchModePicker.centerYAnchor.constraint(equalTo:top.centerYAnchor),scopePicker.leadingAnchor.constraint(equalTo:searchModePicker.trailingAnchor,constant:12),scopePicker.trailingAnchor.constraint(equalTo:top.trailingAnchor,constant:-16),scopePicker.centerYAnchor.constraint(equalTo:top.centerYAnchor),scopePicker.widthAnchor.constraint(equalToConstant:165)])
+        NSLayoutConstraint.activate([top.topAnchor.constraint(equalTo:root.topAnchor),top.leadingAnchor.constraint(equalTo:root.leadingAnchor),top.trailingAnchor.constraint(equalTo:root.trailingAnchor),top.heightAnchor.constraint(equalToConstant:56),back.leadingAnchor.constraint(equalTo:top.leadingAnchor,constant:16),back.centerYAnchor.constraint(equalTo:top.centerYAnchor),back.widthAnchor.constraint(equalToConstant:38),search.leadingAnchor.constraint(equalTo:back.trailingAnchor,constant:8),search.centerYAnchor.constraint(equalTo:top.centerYAnchor),search.trailingAnchor.constraint(equalTo:info.leadingAnchor,constant:-14),search.heightAnchor.constraint(equalToConstant:26),info.widthAnchor.constraint(equalToConstant:32),info.centerYAnchor.constraint(equalTo:top.centerYAnchor),searchModePicker.leadingAnchor.constraint(equalTo:info.trailingAnchor,constant:12),searchModePicker.widthAnchor.constraint(equalToConstant:110),searchModePicker.centerYAnchor.constraint(equalTo:top.centerYAnchor),scopePicker.leadingAnchor.constraint(equalTo:searchModePicker.trailingAnchor,constant:12),scopePicker.trailingAnchor.constraint(equalTo:top.trailingAnchor,constant:-16),scopePicker.centerYAnchor.constraint(equalTo:top.centerYAnchor),scopePicker.widthAnchor.constraint(equalToConstant:165)])
         let topLine=line(); mount(topLine,in:root)
         let footer=NSView(); mount(footer,in:root); let footerLine=line(); mount(footerLine,in:root)
         let body=NSView(); mount(body,in:root)
@@ -1372,7 +1400,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         NSLayoutConstraint.activate([titleLabel.leadingAnchor.constraint(equalTo:left.leadingAnchor,constant:18),titleLabel.trailingAnchor.constraint(equalTo:filterPicker.leadingAnchor,constant:-8),filterPicker.trailingAnchor.constraint(equalTo:left.trailingAnchor,constant:-14),filterPicker.centerYAnchor.constraint(equalTo:titleLabel.centerYAnchor),filterPicker.widthAnchor.constraint(equalToConstant:86),titleLabel.topAnchor.constraint(equalTo:left.topAnchor,constant:10),titleLabel.heightAnchor.constraint(equalToConstant:24),scroll.topAnchor.constraint(equalTo:filterBar.bottomAnchor,constant:8),scroll.leadingAnchor.constraint(equalTo:left.leadingAnchor,constant:4),scroll.trailingAnchor.constraint(equalTo:left.trailingAnchor,constant:-4),scroll.bottomAnchor.constraint(equalTo:left.bottomAnchor,constant:-6),emptyLabel.centerXAnchor.constraint(equalTo:left.centerXAnchor),emptyLabel.topAnchor.constraint(equalTo:scroll.topAnchor,constant:40),emptyLabel.widthAnchor.constraint(equalTo:left.widthAnchor,constant:-32)])
         let emptyActions=NSStackView(views:[widenButton,emptyClearButton,suggestionButton]); emptyActions.orientation = .vertical; emptyActions.spacing=6; mount(emptyActions,in:left); widenButton.isHidden=true; emptyClearButton.isHidden=true; NSLayoutConstraint.activate([emptyActions.centerXAnchor.constraint(equalTo:emptyLabel.centerXAnchor),emptyActions.topAnchor.constraint(equalTo:emptyLabel.bottomAnchor,constant:10)])
         preview=QLPreviewView(frame:.zero,style:.normal); preview.autostarts=false; mount(preview,in:right)
-        pdfView.autoScales=true; pdfView.displayMode = .singlePageContinuous; pdfView.isHidden=true; mount(pdfView,in:right)
+        pdfView.autoScales=true; pdfView.displayMode = .singlePageContinuous; pdfView.isHidden=true; mount(pdfView,in:right);ocrImageView.isHidden=true;mount(ocrImageView,in:right);NSLayoutConstraint.activate([ocrImageView.leadingAnchor.constraint(equalTo:preview.leadingAnchor),ocrImageView.trailingAnchor.constraint(equalTo:preview.trailingAnchor),ocrImageView.topAnchor.constraint(equalTo:preview.topAnchor),ocrImageView.bottomAnchor.constraint(equalTo:preview.bottomAnchor)])
         evidenceLabel.maximumNumberOfLines=2; evidenceLabel.lineBreakMode = .byTruncatingTail; evidenceLabel.font = .systemFont(ofSize:11); evidenceLabel.textColor = .secondaryLabelColor; mount(evidenceLabel,in:right)
         matchesBar=NSStackView(views:[previousMatch,matchLabel,nextMatch]); matchesBar.spacing=10; matchLabel.font = .systemFont(ofSize:11); previousMatch.isEnabled=false; nextMatch.isEnabled=false; mount(matchesBar,in:right)
         evidenceHeight=evidenceLabel.heightAnchor.constraint(equalToConstant:0); matchesHeight=matchesBar.heightAnchor.constraint(equalToConstant:0)
@@ -1396,10 +1424,9 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         NSEvent.addLocalMonitorForEvents(matching:.keyDown) { [weak self] e in
             guard let self, self.window.isKeyWindow, !self.menuTracking else { return e }
             if self.window.attachedSheet != nil { return e }
-            if e.modifierFlags.contains(.command), e.keyCode == 40 { self.openActions(); return nil }
+            if self.dispatchOperationShortcut(e) { return nil }
             if self.window.attachedSheet != nil { return e }
             if e.modifierFlags.contains(.command),e.keyCode == 36 { self.revealSelectedFiles(); return nil }
-            if e.modifierFlags.contains(.command),e.keyCode == 37 { self.window.makeFirstResponder(self.search); return nil }
             if e.modifierFlags.contains(.command),e.keyCode == 4 { self.showRecentSearches(); return nil }
             if e.keyCode == 125 && !self.entries.isEmpty { let inTable=self.window.firstResponder === self.table; self.window.makeFirstResponder(self.table); let next=inTable ? min(self.entries.count-1,max(0,self.table.selectedRow+1)) : max(0,self.table.selectedRow); self.table.selectRowIndexes(IndexSet(integer:next),byExtendingSelection:e.modifierFlags.contains(.shift)); self.table.scrollRowToVisible(next); return nil }
             if e.keyCode == 126 && !self.entries.isEmpty && !e.modifierFlags.contains(.shift) { self.window.makeFirstResponder(self.table); let next=max(0,self.table.selectedRow-1); self.table.selectRowIndexes(IndexSet(integer:next),byExtendingSelection:false); self.table.scrollRowToVisible(next); return nil }
@@ -1413,7 +1440,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
     }
     func saveState() {
         guard !restoringState, window != nil else { return }
-        preferences.set(["frame":NSStringFromRect(window.frame),"layoutVersion":2,"all":scopeAll,"folder":folder.path,"roots":savedScopeOverride ?? searchRoots,"filter":fileFilter.rawValue,"dateFilter":dateFilter,"sizeFilter":sizeFilter,"dateField":dateField,"customStart":customStart,"customEnd":customEnd,"searchMode":searchMode.rawValue,"collection":localCollection ?? (showingRecent ? 0 : 3)],forKey:"workspaceState")
+        preferences.set(["frame":NSStringFromRect(window.frame),"layoutVersion":2,"all":scopeAll,"folder":folder.path,"roots":savedScopeOverride ?? searchRoots,"filter":fileFilter.rawValue,"dateFilter":dateFilter,"sizeFilter":sizeFilter,"dateField":dateField,"customStart":customStart,"customEnd":customEnd,"searchPrecision":precision.rawValue,"searchMode":searchMode.rawValue,"collection":localCollection ?? (showingRecent ? 0 : 3)],forKey:"workspaceState")
     }
     func restoreState(_ state:[String:Any]?) {
         restoringState=true
@@ -1422,7 +1449,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         dateFilter=min(4,max(0,state["dateFilter"] as? Int ?? 0)); sizeFilter=min(3,max(0,state["sizeFilter"] as? Int ?? 0)); dateField=min(1,max(0,state["dateField"] as? Int ?? 0)); customStart=state["customStart"] as? Date ?? customStart; customEnd=state["customEnd"] as? Date ?? customEnd
         fileFilter=FileFilter(rawValue:state["filter"] as? Int ?? 0) ?? .all; filterPicker.selectItem(at:fileFilter.rawValue)
         updateFilterSummary()
-        searchMode=SearchMode(rawValue:state["searchMode"] as? Int ?? 0) ?? .filename; updateSearchModeUI()
+        precision=SearchPrecision(rawValue:state["searchPrecision"] as? Int ?? precision.rawValue) ?? .fuzzyName;searchMode=SearchMode(rawValue:state["searchMode"] as? Int ?? 0) ?? .filename; updateSearchModeUI()
         let home=FileManager.default.homeDirectoryForCurrentUser
         let stored=URL(fileURLWithPath:state["folder"] as? String ?? home.path)
         let values=try? stored.resourceValues(forKeys:[.isDirectoryKey])
@@ -1450,7 +1477,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
     }
     func windowDidMove(_ notification:Notification) { saveState() }
     func windowDidResize(_ notification:Notification) { saveState() }
-    func applicationWillTerminate(_ notification:Notification) { if let qaSuite { preferences.removePersistentDomain(forName:qaSuite) }; catalogQueue.cancelAllOperations(); ocrQueue.cancelAllOperations(); ocrSearchQueue.cancelAllOperations(); controlWake.disable(); directoryRepairQueue.cancelAllOperations(); if previewFixture != nil { directoryRepairQueue.waitUntilAllOperationsAreFinished(); ocrQueue.waitUntilAllOperationsAreFinished(); ocrSearchQueue.waitUntilAllOperationsAreFinished() }; stopWatching(); saveState(); if let fixture=previewFixture { try? FileManager.default.removeItem(at:fixture) } }
+    func applicationWillTerminate(_ notification:Notification) { if managerStarted { ocrManager.stop(wait:previewFixture != nil) };archiveController?.stop();updateDownload?.cancel();updateTask?.cancel();for key in operationHotKeys.values { UnregisterEventHotKey(key) };fileOperationQueue.waitUntilAllOperationsAreFinished(); if let qaSuite { preferences.removePersistentDomain(forName:qaSuite) }; catalogQueue.cancelAllOperations(); ocrQueue.cancelAllOperations(); ocrSearchQueue.cancelAllOperations(); controlWake.disable(); directoryRepairQueue.cancelAllOperations(); if previewFixture != nil { directoryRepairQueue.waitUntilAllOperationsAreFinished(); ocrQueue.waitUntilAllOperationsAreFinished(); ocrSearchQueue.waitUntilAllOperationsAreFinished() }; stopWatching(); saveState(); if let fixture=previewFixture { try? FileManager.default.removeItem(at:fixture) } }
     func persistPins() { preferences.set(pinnedPaths,forKey:"pinnedPaths"); preferences.set(pinBookmarks,forKey:"pinBookmarks") }
     func makeBookmark(_ url:URL)->Data? { try? url.bookmarkData(options:[],includingResourceValuesForKeys:nil,relativeTo:nil) }
     func resolvePins() {
@@ -1484,11 +1511,11 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         }
     }
     func updateSearchModeUI() {
-        searchModePicker.selectItem(at:searchMode.rawValue); search.placeholderString=searchMode.placeholder
-        search.toolTip=searchMode == .content ? "搜索 Spotlight 正文及本地 OCR 文字。扫描版 PDF 和图片请先通过 ⌘K 建立本地 OCR 索引。" : "支持文件名缩写、拼音和路径关键词，多个词需同时匹配。"
+        searchModePicker.selectItem(at:searchMode == .content ? 3 : precision.rawValue); search.placeholderString=searchMode.placeholder
+        search.toolTip=searchMode == .content ? "搜索 Spotlight 正文及本地 OCR 文字。扫描版 PDF 和图片请先通过 ⌘K 建立本地 OCR 索引。" : "名称模糊支持缩写和拼音；名称及路径可匹配父文件夹；精确名称匹配完整名称或不带扩展名的名称。"
     }
     @objc func changeSearchMode() {
-        searchMode=SearchMode(rawValue:searchModePicker.indexOfSelectedItem) ?? .filename; updateSearchModeUI(); saveState()
+        let index=searchModePicker.indexOfSelectedItem;searchMode=index == 3 ? .content : .filename;if index < 3 { precision=SearchPrecision(rawValue:index) ?? .fuzzyName }; updateSearchModeUI(); saveState()
         if !search.stringValue.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty { timer?.invalidate(); startSearch() }
         else { status.stringValue=searchMode == .content ? "内容搜索 · 输入正文中的关键词 · 使用 Spotlight 索引" : "文件名搜索 · 输入文件名" }
         window.makeFirstResponder(search)
@@ -1562,6 +1589,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
     }
     @objc func openActions() {
         let menu=NSMenu(); let hasSelection=selected != nil
+        add31Actions(menu)
         for (title,action) in [("重命名…",#selector(renameSelected)),("移动到文件夹…",#selector(moveSelected)),("移到废纸篓…",#selector(trashSelected)),("添加访达标签…",#selector(editFileTags))] { let item=NSMenuItem(title:title,action:action,keyEquivalent:""); item.target=self; item.isEnabled=hasSelection; menu.addItem(item) }
         let undo=NSMenuItem(title:fileUndos.last?.title ?? "撤销文件操作",action:#selector(undoFileOperation),keyEquivalent:""); undo.target=self; undo.isEnabled = !fileUndos.isEmpty; menu.addItem(undo)
         for (title,action) in [("按访达标签筛选…",#selector(chooseTagFilter)),("建立本地 OCR 索引…",#selector(chooseOCRFolder)),("取消 OCR",#selector(cancelOCR)),("清除本地 OCR 缓存",#selector(clearOCRCache)),("后台索引与资源…",#selector(resourceStatus))] { let item=NSMenuItem(title:title,action:action,keyEquivalent:""); item.target=self; menu.addItem(item) }
@@ -1625,9 +1653,9 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
     }
     func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows flag:Bool)->Bool { show(); return true }
     func windowShouldClose(_ sender: NSWindow) -> Bool { recentSearchTimer?.invalidate(); saveState(); sender.orderOut(nil); return false }
-    @objc func about() { let a = NSAlert(); a.messageText = "KongFetch 3.0"; a.informativeText = "查找 · 预览 · 快捷唤起\n原生 macOS 文件工具\n\n默认快捷键：⌘⌥空格\n首次打开后请在设置中确认快捷键可用。"; a.runModal() }
+    @objc func about() { let a = NSAlert(); a.messageText = "KongFetch 3.1"; a.informativeText = "查找 · 预览 · 快捷唤起\n原生 macOS 文件工具\n\n默认快捷键：⌘⌥空格\n首次打开后请在设置中确认快捷键可用。"; a.runModal() }
     @objc func place(_ sender: NSButton) { scopeAll = sender.tag == 0; if scopeAll { stopQuery(); entries=[]; table.reloadData(); titleLabel.stringValue="全局搜索"; path.stringValue="Spotlight · 当前用户文件及应用程序"; status.stringValue="输入文件名开始搜索"; clearPreview(); window.makeFirstResponder(search); if !search.stringValue.isEmpty { startSearch() } } else { browse(URL(fileURLWithPath: sender.identifier!.rawValue)) } }
-    func stopQuery() { catalogToken=UUID(); catalogQueue.cancelAllOperations(); scanningNames=false; localMatches=[]; spotlightMatches=[]; catalogLimited=false; catalogUnreadable=0; cancelButton.isHidden=true; query?.stop(); query = nil; timer?.invalidate(); generation += 1; resetEvidence() }
+    func stopQuery() { ocrSearchQueue.cancelAllOperations();ocrMatches=[];catalogToken=UUID(); catalogQueue.cancelAllOperations(); scanningNames=false; localMatches=[]; spotlightMatches=[]; catalogLimited=false; catalogUnreadable=0; cancelButton.isHidden=true; query?.stop(); query = nil; timer?.invalidate(); generation += 1; resetEvidence() }
     func browse(_ url: URL, push: Bool = true) { savedScopeOverride=nil;
         defer { saveState() }
         stopQuery(); localCollection=nil; collectionTabs.selectedSegment = -1; showingRecent=false; scopeAll = false; if push && url != folder { history.append(folder) }; folder = url; if scopePicker.numberOfItems > 7 { scopePicker.removeItem(at:7) }; scopePicker.addItem(withTitle:"文件夹："+url.lastPathComponent); scopePicker.selectItem(at:7); search.stringValue = ""; titleLabel.stringValue = url.lastPathComponent; path.stringValue = url.path; clearPreview()
@@ -1671,14 +1699,14 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         let roots=expandedRoots(activeSearchRoots)
         watch(roots); catalogToken=UUID(); let scanToken=catalogToken
         let policy=ResourcePolicy(adaptive:adaptiveResources)
-        let cacheKey=roots.map(\.path).joined(separator:"\n"),token=generation,cached=catalogCache[cacheKey],validated=validatedCatalogs.contains(cacheKey),store=catalogStore,saveWasFailed=catalogSaveFailed,exclusions=excludedRoots
+        let cacheKey=roots.map(\.path).joined(separator:"\n"),token=generation,cached=catalogCache[cacheKey],validated=validatedCatalogs.contains(cacheKey),store=catalogStore,saveWasFailed=catalogSaveFailed,exclusions=excludedRoots,precision=precision
         scanningNames=true; catalogSaveFailed=false; cancelButton.isHidden=false
         let operation=BlockOperation()
         operation.addExecutionBlock { [weak self,weak operation] in
             guard let operation,!operation.isCancelled else { return }
             func deliver(_ catalog:CatalogResult,complete:Bool,saveFailed:Bool=false) {
                 var matches:[Entry]=[]
-                for url in catalog.urls { if operation.isCancelled { return }; if !exclusions.contains(where:{ let path=canonicalIndexPath(url); let root=canonicalIndexPath(URL(fileURLWithPath:$0)); return path == root || path.hasPrefix(root+"/") }) && filenameScore(url,words:input.words) != nil && FileManager.default.fileExists(atPath:url.path) { matches.append(Entry(url)) } }
+                for url in catalog.urls { if operation.isCancelled { return }; if !exclusions.contains(where:{ let path=canonicalIndexPath(url); let root=canonicalIndexPath(URL(fileURLWithPath:$0)); return path == root || path.hasPrefix(root+"/") }) && precision.score(url,words:input.words) != nil && FileManager.default.fileExists(atPath:url.path) { matches.append(Entry(url)) } }
                 DispatchQueue.main.async { guard let self,self.generation == token,self.catalogToken == scanToken else { return }
                     if self.catalogCache.count >= 3 { self.catalogCache.removeAll() }; self.catalogCache[cacheKey]=(Date(),catalog)
                     if complete { self.validatedCatalogs.insert(cacheKey); self.reportIndex(self.catalogSummary(catalog)+(saveFailed ? "\n索引保存失败" : "")) }
@@ -1726,7 +1754,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         let effectiveFilter=showingRecent ? fileFilter : input.filter
         let natural=naturalQuery; entries=entries.filter(effectiveFilter.accepts).filter { acceptsDetails($0,natural:natural) }
         if showingRecent { entries.sort { ($0.modified ?? .distantPast) > ($1.modified ?? .distantPast) } }
-        if !showingRecent { entries=rankEntries(entries,words:searchMode == .content ? [] : input.words,counts:openCounts,preferredPath:rememberedSearchPath,manualPath:manualSearchPath,aliasPath:currentAliasPath) }
+        if !showingRecent { entries=rankEntries(entries,words:searchMode == .content ? [] : input.words,counts:openCounts,preferredPath:rememberedSearchPath,manualPath:manualSearchPath,aliasPath:currentAliasPath,scoreProvider:searchMode == .filename ? { [precision] url,words in precision.score(url,words:words) } : nil) }
         if !showingRecent,let key=searchChoiceKey {
             let rejected=Set((preferences.dictionary(forKey:"rejectedResults")?[key] as? [String]) ?? [])
             entries=entries.filter { !rejected.contains($0.url.path) } + entries.filter { rejected.contains($0.url.path) }
@@ -1741,7 +1769,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         else if !entries.isEmpty { table.selectRowIndexes(IndexSet(integer:0),byExtendingSelection:false) }
         if !previousURLs.isEmpty { let kept=previousURLs.filter { url in entries.contains { $0.url == url } }; if !kept.isEmpty { selectURLs(kept) } }
         tableViewSelectionDidChange(Notification(name:NSTableView.selectionDidChangeNotification))
-        status.stringValue=showingRecent ? "最近修改 · \(entries.count) 个项目" : "\(entries.count) 个结果 · \(searchMode.title)\(matchedCount > limit ? "（已限制显示数量）" : "")\(searchMode == .content ? " · Spotlight／本地 OCR" : " · 模糊匹配")"
+        status.stringValue=showingRecent ? "最近修改 · \(entries.count) 个项目" : "\(entries.count) 个结果 · \(searchMode.title)\(matchedCount > limit ? "（已限制显示数量）" : "")\(searchMode == .content ? " · Spotlight／本地 OCR" : " · "+precision.title)"
         if scanningNames { status.stringValue += " · 正在更新文件索引" }; if catalogLimited { status.stringValue += " · 索引未完成" }; if catalogUnreadable > 0 { status.stringValue += " · 部分目录不可访问" }; if catalogSaveFailed { status.stringValue += " · 索引保存失败，本次仍可搜索" }; status.stringValue = (scopeAll ? "全用户" : "当前目录")+" · "+status.stringValue; status.toolTip="搜索范围："+activeSearchRoots.joined(separator:"\n")+"\n"+status.stringValue; cancelButton.isHidden = !(scanningNames || query?.isGathering == true)
     }
     func numberOfRows(in tableView:NSTableView)->Int { entries.count }
@@ -1789,12 +1817,14 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         evidenceQueue.addOperation(operation)
     }
     func resetEvidence() {
+        resetOCRPositions()
         evidenceQueue.cancelAllOperations(); previewQueue.cancelAllOperations(); snippetOrder=[]; snippets=[:]; snippetRequests=[]; previewToken=UUID(); pdfMatches=[]; matchIndex=0; pdfView.document=nil; pdfView.isHidden=true; preview?.isHidden=false; evidenceLabel.stringValue=""; matchLabel.stringValue=""; previousMatch.isEnabled=false; nextMatch.isEnabled=false
     }
     func prepareEvidence(_ entry:Entry) {
-        previewQueue.cancelAllOperations(); previewToken=UUID(); let token=previewToken; let words=evidenceWords
+        resetOCRPositions();previewQueue.cancelAllOperations(); previewToken=UUID(); let token=previewToken; let words=evidenceWords
         pdfMatches=[]; matchIndex=0; pdfView.document=nil; pdfView.isHidden=true; preview.isHidden=false; previousMatch.isEnabled=false; nextMatch.isEnabled=false; matchLabel.stringValue=""; evidenceLabel.stringValue=""
         guard !words.isEmpty else { return }
+        if let record=ocrRecords[entry.url.path],record.isCurrent(),showOCRPositions(entry,record:record,words:words) { return }
         if let record=ocrRecords[entry.url.path],record.isCurrent() { evidenceLabel.attributedStringValue=highlightExcerpt("本地 OCR · "+excerptText(record.text,words:words)); evidenceLabel.toolTip=String(record.text.prefix(4000)); matchLabel.stringValue="OCR 文字命中"+(record.limited ? " · 仅部分页面" : ""); return }
         evidenceLabel.stringValue="正在读取命中摘要…"
         let operation=BlockOperation()
@@ -1814,6 +1844,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         previewQueue.addOperation(operation)
     }
     func updateMatch() {
+        if !ocrPositions.isEmpty { updateOCRPosition();return }
         let count=pdfMatches.count; previousMatch.isEnabled=count > 1; nextMatch.isEnabled=count > 1
         guard count > 0,let document=pdfView.document else { matchLabel.stringValue="没有可定位的匹配"+(pdfLimited ? " · 仅检查部分正文" : ""); return }
         matchIndex=(matchIndex+count)%count; let selection=pdfMatches[matchIndex]; pdfView.setCurrentSelection(selection,animate:false); pdfView.go(to:selection)
@@ -1825,7 +1856,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
     @objc func nextPDFMatch() { matchIndex += 1; updateMatch() }
     var selected: Entry? { table.selectedRow >= 0 && table.selectedRow < entries.count ? entries[table.selectedRow] : nil }
     func tableView(_ tableView:NSTableView,rowViewForRow row:Int)->NSTableRowView? { RoundedRow() }
-    func clearPreview() { previewQueue.cancelAllOperations(); previewToken=UUID(); pdfMatches=[]; pdfView.document=nil; pdfView.isHidden=true; preview.isHidden=false; evidenceLabel.stringValue=""; matchLabel.stringValue=""; previousMatch.isEnabled=false; nextMatch.isEnabled=false; preview.previewItem=nil; detail.stringValue="选择文件查看预览"; metadataValues.forEach { $0.stringValue="—"; $0.toolTip=nil } }
+    func clearPreview() { resetOCRPositions(); previewQueue.cancelAllOperations(); previewToken=UUID(); pdfMatches=[]; pdfView.document=nil; pdfView.isHidden=true; preview.isHidden=false; evidenceLabel.stringValue=""; matchLabel.stringValue=""; previousMatch.isEnabled=false; nextMatch.isEnabled=false; preview.previewItem=nil; detail.stringValue="选择文件查看预览"; metadataValues.forEach { $0.stringValue="—"; $0.toolTip=nil } }
     func tableViewSelectionDidChange(_ notification:Notification) {
         updateNavigation(); guard let e=selected else { clearPreview(); return }; preview.previewItem=FileManager.default.fileExists(atPath:e.url.path) ? e.url as NSURL : nil; detail.stringValue=e.url.lastPathComponent; if searchMode == .content,let record=ocrRecords[e.url.path],record.isCurrent() { evidenceLabel.stringValue="本地 OCR · "+excerptText(record.text,words:evidenceWords,allowWhitespace:true) }
         let location=(e.url.deletingLastPathComponent().path as NSString).abbreviatingWithTildeInPath
@@ -1888,6 +1919,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
     @objc func reveal() { guard let e=selected else { return }; NSWorkspace.shared.activateFileViewerSelecting([e.url]) }
     func quickLook() { guard let e=selected else { return }; let p=NSPanel(contentRect:NSRect(x:0,y:0,width:760,height:600),styleMask:[.titled,.closable,.resizable],backing:.buffered,defer:false); p.title=e.url.lastPathComponent; let v=QLPreviewView(frame:p.contentView!.bounds,style:.normal)!; v.autoresizingMask=[.width,.height]; v.previewItem=e.url as NSURL; p.contentView!.addSubview(v); p.isReleasedWhenClosed=false; previewPanels.removeAll { !$0.isVisible }; previewPanels.append(p); p.center(); p.makeKeyAndOrderFront(nil) }
     func register(code:UInt32, modifiers:UInt32)->Bool {
+        if operationBindings.contains(where:{$0.enabled && $0.code == Int(code) && $0.mods == Int(modifiers)}) {return false}
         if let current=registeredShortcut, current.0 == code && current.1 == modifiers, hotKey != nil { return true }
         var candidate:EventHotKeyRef?; let result=RegisterEventHotKey(code,modifiers,EventHotKeyID(signature:0x4B464554,id:1),GetApplicationEventTarget(),0,&candidate)
         if result != noErr { return false }; if let old=hotKey { UnregisterEventHotKey(old) }; hotKey=candidate; registeredShortcut=(code,modifiers); return true
@@ -1997,7 +2029,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
             alert.accessoryView=field
             alert.beginSheetModal(for:self.window) { result in
                 guard result == .alertFirstButtonReturn,let item=candidate else { return }
-                var test:EventHotKeyRef?; let ok=RegisterEventHotKey(UInt32(item["code"] as! Int),UInt32(item["mods"] as! Int),EventHotKeyID(signature:0x4B464554,id:999),GetApplicationEventTarget(),0,&test) == noErr
+                if self.operationBindings.contains(where:{$0.enabled && $0.code == item["code"] as? Int && $0.mods == item["mods"] as? Int}) {self.status.stringValue="该组合已用于操作快捷键，请重新选择";return};var test:EventHotKeyRef?; let ok=RegisterEventHotKey(UInt32(item["code"] as! Int),UInt32(item["mods"] as! Int),EventHotKeyID(signature:0x4B464554,id:999),GetApplicationEventTarget(),0,&test) == noErr
                 if let test { UnregisterEventHotKey(test) }; guard ok else { self.status.stringValue="快捷键已被占用，请重新选择"; return }
                 self.preferences.set(self.directoryShortcuts+[item],forKey:"directoryShortcuts"); self.registerDirectoryShortcuts(); self.status.stringValue="目录快捷键已保存"
             }
@@ -2006,7 +2038,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
     @objc func wakeDiagnostics() {
         let alert=NSAlert(); alert.messageText="唤起诊断"
         let date: (Date?) -> String = { $0.map { self.dateFormat.string(from:$0) } ?? "尚未收到" }
-        alert.informativeText="输入监控权限："+(CGPreflightListenEventAccess() ? "已允许" : "未允许")+"\n双 Control："+(controlWake.tap.map { CGEvent.tapIsEnabled(tap:$0) ? "正在监听" : "监听已暂停" } ?? "未启动")+"\n最近键盘事件："+date(controlWake.lastEvent)+"\n最近后台键盘事件："+date(controlWake.lastBackgroundEvent)+"\n最近双 Control："+date(controlWake.lastWake)+"（"+(controlWake.lastWakeWasGlobal ? "其他应用前台" : "本应用前台／备用识别")+"）\n"+wakeReport+"\n版本：3.0 · "+Bundle.main.bundleURL.path+"\n组合快捷键："+(hotKey == nil ? "注册失败" : "已注册")+"\n目录快捷键：\(directoryHotKeys.count) 个有效\n"+directoryShortcutErrors.joined(separator:"\n")+"\n\n点击测试后关闭窗口，再连按两次 Control。随后会显示收到事件、窗口可见、输入焦点三项结果。"
+        alert.informativeText="输入监控权限："+(CGPreflightListenEventAccess() ? "已允许" : "未允许")+"\n双 Control："+(controlWake.tap.map { CGEvent.tapIsEnabled(tap:$0) ? "正在监听" : "监听已暂停" } ?? "未启动")+"\n最近键盘事件："+date(controlWake.lastEvent)+"\n最近后台键盘事件："+date(controlWake.lastBackgroundEvent)+"\n最近双 Control："+date(controlWake.lastWake)+"（"+(controlWake.lastWakeWasGlobal ? "其他应用前台" : "本应用前台／备用识别")+"）\n"+wakeReport+"\n版本：3.1 · "+Bundle.main.bundleURL.path+"\n组合快捷键："+(hotKey == nil ? "注册失败" : "已注册")+"\n目录快捷键：\(directoryHotKeys.count) 个有效\n"+directoryShortcutErrors.joined(separator:"\n")+"\n\n点击测试后关闭窗口，再连按两次 Control。随后会显示收到事件、窗口可见、输入焦点三项结果。"
         alert.addButton(withTitle:"测试双 Control"); alert.addButton(withTitle:"关闭"); alert.addButton(withTitle:"授权／重新检测")
         alert.beginSheetModal(for:window) { [weak self] response in guard let self else { return }
             if response == .alertFirstButtonReturn {
@@ -2126,6 +2158,8 @@ if CommandLine.arguments.contains("--control-check") {
     precondition(!d.update(control:false,other:false,key:false,time:4.1))
     print("PASS double Control, combination cancellation, long hold and slow taps"); exit(0)
 }
+if CommandLine.arguments.contains("--install-helper") { do { try runInstallHelper(CommandLine.arguments);exit(0) } catch { fputs(error.localizedDescription+"\n",stderr);exit(1) } }
+if CommandLine.arguments.contains("--verify-update-package") || CommandLine.arguments.contains("--verify-update-download") {do {setbuf(stdout,nil);if CommandLine.arguments.contains("--verify-update-package") {try verifyPackageCLI(CommandLine.arguments)} else {try verifyDownloadCLI(CommandLine.arguments)};exit(0)} catch {fputs(error.localizedDescription+"\n",stderr);exit(1)}}
 let application=NSApplication.shared
 if CommandLine.arguments.contains("--icon-check") {
     let icon=kongFetchMenuIcon(); precondition(icon.isTemplate && icon.size == NSSize(width:22,height:22))
