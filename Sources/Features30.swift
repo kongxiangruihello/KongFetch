@@ -161,7 +161,7 @@ struct FileUndo {
     let reverse:() throws -> Void
 }
 extension App {
-    var naturalQuery:NaturalQuery { NaturalQuery(search.stringValue) }
+    var naturalQuery:NaturalQuery { SearchInput(search.stringValue,fallback:fileFilter).advanced.natural }
     var adaptiveResources:Bool { preferences.object(forKey:"adaptiveResources") as? Bool ?? true }
     func refreshAfterFileOperation() {
         resolveSearchTargets(all:true); registerDirectoryShortcuts(); catalogCache.removeAll(); validatedCatalogs.removeAll(); filenameScoreCache.removeAllObjects()
@@ -232,8 +232,7 @@ extension App {
             for record in records {
                 if operation.isCancelled { return }; let url=URL(fileURLWithPath:record.path),path=canonicalIndexPath(url.resolvingSymlinksInPath())
                 guard record.isCurrent(),!exclusions.contains(where:{ path == $0 || path.hasPrefix($0+"/") }),roots.contains(where:{ path == $0 || path.hasPrefix($0+"/") }) else { continue }
-                let text=record.text.folding(options:[.caseInsensitive,.diacriticInsensitive,.widthInsensitive],locale:Locale(identifier:"en_US_POSIX"))
-                let compact=text.filter { !$0.isWhitespace }; if input.words.allSatisfy({ text.contains(normalized($0)) || compact.contains(normalized($0).filter { !$0.isWhitespace }) }) { matches.append(Entry(url)) }
+                if input.advanced.acceptsContent(record.text) && input.advanced.acceptsURL(url,mode:.content,precision:.fuzzyName) { matches.append(Entry(url)) }
             }
             DispatchQueue.main.async { guard let self,!operation.isCancelled,self.generation == token,self.searchMode == .content else { return }; self.ocrMatches=matches; for e in matches { if let record=self.ocrRecords[e.url.path] { self.snippets[e.url.path]="本地 OCR · "+excerptText(record.text,words:input.words,allowWhitespace:true) } }; self.renderSearchResults() }
         }; ocrSearchQueue.addOperation(operation)

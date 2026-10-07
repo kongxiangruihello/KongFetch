@@ -5,15 +5,26 @@
 
 ## 下载与安装
 
-当前版本：**3.1**。
+当前版本：**3.2**。
 
-- [下载 DMG 安装包](https://github.com/kongxiangruihello/KongFetch/raw/refs/heads/main/dist/KongFetch-3.1-Mac.dmg)
-- [下载 ZIP 安装包](https://github.com/kongxiangruihello/KongFetch/raw/refs/heads/main/dist/KongFetch-3.1-Mac.zip)
-- [SHA-256 校验值](dist/KongFetch-3.1-SHA256.txt)
+- [下载 DMG 安装包](https://github.com/kongxiangruihello/KongFetch/raw/refs/heads/main/dist/KongFetch-3.2-Mac.dmg)
+- [下载 ZIP 安装包](https://github.com/kongxiangruihello/KongFetch/raw/refs/heads/main/dist/KongFetch-3.2-Mac.zip)
+- [SHA-256 校验值](dist/KongFetch-3.2-SHA256.txt)
 
 退出旧版，把 KongFetch.app 拖入 Applications，再打开。应用运行时快捷键生效，可在设置中启用登录启动。
 
 安装包使用本地 ad hoc 签名，未使用 Developer ID 或 Apple 公证。更新后双 Control 可能需要重新确认输入监控权限；如果无反应，请在系统设置的输入监控中移除旧条目，再添加 `/Applications/KongFetch.app` 并允许，退出后重新打开。
+
+## 3.2 新增
+
+- 漏搜诊断与目标附近目录修复。
+- 引号短语、排除词、扩展名组合搜索，例如 `ext:pdf "年度合同" -草稿`。
+- 可搜索的 ⌘K 操作面板，显示快捷键并保留原有操作。
+- ⌘→ 在选中文件夹继续搜索，⌘← 恢复原搜索、选择和滚动位置。
+- OCR文字选择复制、TXT导出及选中文字搜索。
+- 按实际内容查找重复文件，预览核对，支持取消。
+- 中文输入保护、⌘1–9打开结果及后台更新位置保持。
+- 本机剪贴板历史：文字、图片、文件引用、搜索、固定、暂停、清空；⌃⌥V全局打开，首次手动启用记录。跳过敏感标记与排除应用。
 
 ## 功能
 
@@ -32,7 +43,7 @@
 
 新增功能从右下角 **操作 ⌘K** 进入。OCR 需先选择文件夹建立索引，然后顶部选择“文件内容”。识别文字保存在本机，原文件不修改。
 
-完整说明和限制见 [3.1 使用说明](docs/开始使用-3.1.txt)。OCR 每文件最多 100 MB、PDF 前 30 页、50 万字符；云端未下载文件会跳过。所选目录在启动与文件变化后自动检查。撤销记录最多 20 条，仅保留在本次运行中。
+完整说明和限制见 [3.2 使用说明](docs/开始使用-3.2.txt)。OCR 每文件最多 100 MB、PDF 前 30 页、50 万字符；云端未下载文件会跳过。所选目录在启动与文件变化后自动检查。撤销记录最多 20 条，仅保留在本次运行中。
 
 ## 默认全局操作快捷键
 
@@ -71,7 +82,7 @@ bash scripts/check.sh
 
 GUI 检查应在已登录的 macOS 桌面会话中运行，使用临时文件验证搜索、预览、设置升级、文件撤销、真实中文图片和扫描 PDF OCR、标签、筛选及 Control 双击识别。
 
-3.1 已在 Apple 芯片上通过功能及界面检查。Intel 编译通过，尚未在 Intel 实机运行。系统权限及实体双 Control 跨应用唤起需在安装版本上手动确认。
+3.2 已在 Apple 芯片上通过功能及界面检查。Intel 编译通过，尚未在 Intel 实机运行。系统权限及实体双 Control 跨应用唤起需在安装版本上手动确认。
 
 ## 源码
 

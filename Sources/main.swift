@@ -56,14 +56,10 @@ enum SearchMode:Int {
     var placeholder:String { self == .filename ? "搜索文件…" : "搜索文件中的文字…" }
 }
 struct SearchInput {
-    let words:[String]
-    let filter:FileFilter
-    init(_ text:String, fallback:FileFilter) {
-        var parts=NaturalQuery(text).text.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-        let aliases:[String:FileFilter] = ["pdf":.pdf,"doc":.documents,"文档":.documents,"image":.images,"图片":.images,"audio":.audio,"音频":.audio,"video":.video,"视频":.video,"folder":.folders,"文件夹":.folders]
-        if let first=parts.first?.lowercased(), let type=aliases[first] { filter=type; parts.removeFirst() } else { filter=fallback }
-        words=parts
-    }
+    let advanced:AdvancedSearchQuery
+    var words:[String] { advanced.highlightWords }
+    var filter:FileFilter { advanced.filter }
+    init(_ text:String, fallback:FileFilter) { advanced=AdvancedSearchQuery(text,fallback:fallback) }
 }
 // Independently implemented; inspired by the published Cling/fzf matching principles.
 let normalizedCache:NSCache<NSString,NSString> = { let c=NSCache<NSString,NSString>(); c.countLimit=50000; return c }()
@@ -492,6 +488,14 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
     var archiveController:ArchiveSearchController?
     var batchController:BatchRenameController?
     var shortcutController:OperationShortcutController?
+    var paletteController32:CommandPalette32?
+    var searchDiagnosis32:SearchDiagnosisController?
+    var clipboardManager32:ClipboardHistory32?
+    var clipboardPanel32:ClipboardPanel32?
+    var ocrTextPanel32:OCRTextPanel32?
+    var duplicateController:DuplicateFinderController?
+    var navigationHistory32:[SearchNavigation32]=[]
+    var pendingNavigation32:ListPosition32?
     let ocrImageView=OCRImageView()
     var ocrPositions:[(Int,CGRect)]=[]
     var operationHotKeys:[UInt32:EventHotKeyRef]=[:]
@@ -644,7 +648,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         let words=SearchInput(search.stringValue,fallback:fileFilter).words
         for key in ["searchAliases","searchChoices"] {
             guard let items=preferences.dictionary(forKey:key) as? [String:[String:Any]] else { continue }
-            let queryKey=key == "searchAliases" ? aliasKey(words.joined(separator:" ")) : "\(searchMode.rawValue):"+words.map(normalized).joined(separator:"\u{001F}")
+            let queryKey=key == "searchAliases" ? aliasKey(words.joined(separator:" ")) : (rawSearchChoiceKey32 ?? "")
             var updated=items; var changed=false
             for itemKey in all ? Array(items.keys) : [queryKey] { if let item=items[itemKey] { let tracked=trackedItem(item); if !NSDictionary(dictionary:tracked).isEqual(to:item) { updated[itemKey]=tracked; changed=true } } }
             if changed { preferences.set(updated,forKey:key) }
@@ -801,11 +805,11 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
     @objc func widenSearch() { expandSearchScope(); saveState()
         if search.stringValue.isEmpty { loadRecent() } else { startSearch() }
     }
-    var hasSearchRestrictions:Bool { SearchInput(search.stringValue,fallback:fileFilter).filter != .all || dateFilter != 0 || sizeFilter != 0 || !tagFilter.isEmpty || !naturalQuery.descriptions.isEmpty }
+    var hasSearchRestrictions:Bool { SearchInput(search.stringValue,fallback:fileFilter).advanced.hasConstraints || SearchInput(search.stringValue,fallback:fileFilter).filter != .all || dateFilter != 0 || sizeFilter != 0 || !tagFilter.isEmpty || !naturalQuery.descriptions.isEmpty }
     func removeSearchRestrictions() {
         let input=SearchInput(search.stringValue,fallback:fileFilter)
-        if input.filter != fileFilter || input.words.count != search.stringValue.split(whereSeparator: { $0.isWhitespace }).count { search.stringValue=input.words.joined(separator:" ") }
-        fileFilter = .all; filterPicker.selectItem(at:0); dateFilter=0; sizeFilter=0; tagFilter=""; preferences.set("",forKey:"tagFilter"); if !naturalQuery.descriptions.isEmpty { search.stringValue=SearchInput(search.stringValue,fallback:.all).words.joined(separator:" ") }; updateFilterSummary()
+        search.stringValue=input.advanced.positiveText32
+        fileFilter = .all; filterPicker.selectItem(at:0); dateFilter=0; sizeFilter=0; tagFilter=""; preferences.set("",forKey:"tagFilter"); updateFilterSummary()
     }
     @objc func clearSearchRestrictions() { removeSearchRestrictions(); saveState(); if search.stringValue.isEmpty { loadRecent() } else { startSearch() } }
     var isFullSearchScope:Bool { scopeAll && savedScopeOverride == nil && Set(searchRoots) == Set([NSHomeDirectory(),"/Applications"]) }
@@ -877,7 +881,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
                 if !self.search.stringValue.isEmpty && self.searchMode == .filename && self.localCollection == nil {
                     let input=SearchInput(self.search.stringValue,fallback:self.fileFilter),currentRoots=self.expandedRoots(self.activeSearchRoots)
                     self.localMatches.removeAll { canonicalIndexPath($0.url).hasPrefix(prefix+"/") }
-                    self.localMatches += result.urls.filter { url in let path=canonicalIndexPath(url); return currentRoots.contains { path.hasPrefix(canonicalIndexPath($0)+"/") } && self.precision.score(url,words:input.words) != nil }.map(Entry.init)
+                    self.localMatches += result.urls.filter { url in let path=canonicalIndexPath(url); return currentRoots.contains { path.hasPrefix(canonicalIndexPath($0)+"/") } && input.advanced.filenameScore(url,precision:self.precision) != nil }.map(Entry.init)
                     self.renderSearchResults()
                 }
             }
@@ -947,10 +951,10 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         if fileFilter != .all { parts.append(fileFilter.title) }
         if dateFilter != 0 { parts.append((dateField == 0 ? "修改 · " : "创建 · ")+dateTitles[dateFilter]) }
         if sizeFilter != 0 { parts.append(sizeTitles[sizeFilter]) }
-        if !tagFilter.isEmpty { parts.append("标签："+tagFilter) }; if !showingRecent { parts += naturalQuery.descriptions }; filterSummary.stringValue=parts.isEmpty ? "未设置筛选" : parts.joined(separator:" · "); filterSummary.toolTip=filterSummary.stringValue
+        if !tagFilter.isEmpty { parts.append("标签："+tagFilter) }; if !showingRecent { parts += naturalQuery.descriptions+SearchInput(search.stringValue,fallback:fileFilter).advanced.descriptions }; filterSummary.stringValue=parts.isEmpty ? "未设置筛选" : parts.joined(separator:" · "); filterSummary.toolTip=filterSummary.stringValue
         clearFiltersButton.isHidden=parts.isEmpty
     }
-    @objc func clearFilters() { fileFilter = .all; filterPicker.selectItem(at:0); dateFilter=0; sizeFilter=0; tagFilter=""; preferences.set("",forKey:"tagFilter"); if !naturalQuery.descriptions.isEmpty { search.stringValue=NaturalQuery(search.stringValue).text }; changeFilter() }
+    @objc func clearFilters() { removeSearchRestrictions(); changeFilter() }
     @objc func editFilters() {
         let alert=NSAlert(); alert.messageText="筛选文件"; alert.informativeText="日期按本地日历计算，大小按文件字节数计算；大小筛选不包含文件夹。"; alert.addButton(withTitle:"应用"); alert.addButton(withTitle:"取消")
         let dates=NSPopUpButton(); dates.addItems(withTitles:dateTitles); dates.selectItem(at:dateFilter)
@@ -1047,6 +1051,8 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
             for i in 0..<500 { try! Data([1]).write(to:fixture.appendingPathComponent("sample-\(i).txt")) }
             restoringState=true; catalogStore=CatalogStore(fixture.appendingPathComponent(".indexes")); scopeAll=false; folder=fixture; fileFilter = .all; filterPicker.selectItem(at:0); dateFilter=0; sizeFilter=0; searchMode = .filename; search.stringValue="sample-0"; startSearch(); show(); return
         }
+        if CommandLine.arguments.contains("--release32-check") { release32Check(); return }
+        if CommandLine.arguments.contains("--release32-ui-check") { release32UI(); return }
         if CommandLine.arguments.contains("--release31-check") { release31Check(); return }
         if CommandLine.arguments.contains("--release31-ui-check") { release31UI(); return }
         if CommandLine.arguments.contains("--release30-check") { release30Check(); return }
@@ -1065,7 +1071,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         }
         if CommandLine.arguments.contains("--preview-check") { previewCheck(); return }
         NotificationCenter.default.addObserver(self,selector:#selector(refreshLoginStatus),name:NSApplication.didBecomeActiveNotification,object:nil)
-        extraRoots=preferences.stringArray(forKey:"extraSearchRoots") ?? []; resolveSearchTargets(all:true); registerDirectoryShortcuts(); registerOperationShortcuts(); restoreState(storedState); show(); reportLastUpdate()
+        extraRoots=preferences.stringArray(forKey:"extraSearchRoots") ?? []; resolveSearchTargets(all:true); registerDirectoryShortcuts(); registerOperationShortcuts(); restoreState(storedState); startClipboardHistory32(); show(); reportLastUpdate()
     }
     func upgradeCheck() {
         let fixture=URL(fileURLWithPath:"/tmp/kongfetch27-"+UUID().uuidString); previewFixture=fixture; try! FileManager.default.createDirectory(at:fixture,withIntermediateDirectories:true)
@@ -1421,21 +1427,10 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         let actions=button("操作  ⌘K",#selector(openActions)); actions.isBordered=false; actions.font = .systemFont(ofSize:16); actionsButton=actions; mount(actions,in:footer)
         NSLayoutConstraint.activate([brand.leadingAnchor.constraint(equalTo:footer.leadingAnchor,constant:18),brand.widthAnchor.constraint(equalToConstant:25),brand.heightAnchor.constraint(equalToConstant:25),brand.centerYAnchor.constraint(equalTo:footer.centerYAnchor),status.leadingAnchor.constraint(equalTo:brand.trailingAnchor,constant:12),status.trailingAnchor.constraint(equalTo:cancelButton.leadingAnchor,constant:-8),cancelButton.trailingAnchor.constraint(equalTo:open.leadingAnchor,constant:-10),cancelButton.widthAnchor.constraint(equalToConstant:52),cancelButton.centerYAnchor.constraint(equalTo:footer.centerYAnchor),status.centerYAnchor.constraint(equalTo:footer.centerYAnchor),open.trailingAnchor.constraint(equalTo:actions.leadingAnchor,constant:-18),open.widthAnchor.constraint(equalToConstant:70),open.centerYAnchor.constraint(equalTo:footer.centerYAnchor),actions.trailingAnchor.constraint(equalTo:footer.trailingAnchor,constant:-18),actions.widthAnchor.constraint(equalToConstant:95),actions.centerYAnchor.constraint(equalTo:footer.centerYAnchor)])
         window.makeFirstResponder(search)
-        NSEvent.addLocalMonitorForEvents(matching:.keyDown) { [weak self] e in
-            guard let self, self.window.isKeyWindow, !self.menuTracking else { return e }
-            if self.window.attachedSheet != nil { return e }
-            if self.dispatchOperationShortcut(e) { return nil }
-            if self.window.attachedSheet != nil { return e }
-            if e.modifierFlags.contains(.command),e.keyCode == 36 { self.revealSelectedFiles(); return nil }
-            if e.modifierFlags.contains(.command),e.keyCode == 4 { self.showRecentSearches(); return nil }
-            if e.keyCode == 125 && !self.entries.isEmpty { let inTable=self.window.firstResponder === self.table; self.window.makeFirstResponder(self.table); let next=inTable ? min(self.entries.count-1,max(0,self.table.selectedRow+1)) : max(0,self.table.selectedRow); self.table.selectRowIndexes(IndexSet(integer:next),byExtendingSelection:e.modifierFlags.contains(.shift)); self.table.scrollRowToVisible(next); return nil }
-            if e.keyCode == 126 && !self.entries.isEmpty && !e.modifierFlags.contains(.shift) { self.window.makeFirstResponder(self.table); let next=max(0,self.table.selectedRow-1); self.table.selectRowIndexes(IndexSet(integer:next),byExtendingSelection:false); self.table.scrollRowToVisible(next); return nil }
-            if e.keyCode == 53 { self.recentSearchTimer?.invalidate(); self.window.orderOut(nil); return nil }
-            if self.window.firstResponder === self.table {
-                if e.keyCode == 49 { self.quickLook(); return nil }
-                if e.keyCode == 36 { self.openSelected(); return nil }
-            }
-            return e
+        NSEvent.addLocalMonitorForEvents(matching:[.keyDown,.leftMouseDown,.scrollWheel]) { [weak self] event in
+            guard let self else { return event }
+            if event.type != .keyDown { if self.window.isKeyWindow,self.table.visibleRect.contains(self.table.convert(event.locationInWindow,from:nil)) { self.pendingNavigation32=nil }; return event }
+            return self.routeSearchKey32(event) ? nil : event
         }
     }
     func saveState() {
@@ -1477,7 +1472,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
     }
     func windowDidMove(_ notification:Notification) { saveState() }
     func windowDidResize(_ notification:Notification) { saveState() }
-    func applicationWillTerminate(_ notification:Notification) { if managerStarted { ocrManager.stop(wait:previewFixture != nil) };archiveController?.stop();updateDownload?.cancel();updateTask?.cancel();for key in operationHotKeys.values { UnregisterEventHotKey(key) };fileOperationQueue.waitUntilAllOperationsAreFinished(); if let qaSuite { preferences.removePersistentDomain(forName:qaSuite) }; catalogQueue.cancelAllOperations(); ocrQueue.cancelAllOperations(); ocrSearchQueue.cancelAllOperations(); controlWake.disable(); directoryRepairQueue.cancelAllOperations(); if previewFixture != nil { directoryRepairQueue.waitUntilAllOperationsAreFinished(); ocrQueue.waitUntilAllOperationsAreFinished(); ocrSearchQueue.waitUntilAllOperationsAreFinished() }; stopWatching(); saveState(); if let fixture=previewFixture { try? FileManager.default.removeItem(at:fixture) } }
+    func applicationWillTerminate(_ notification:Notification) { if managerStarted { ocrManager.stop(wait:previewFixture != nil) };duplicateController?.stop();searchDiagnosis32?.stop();stopClipboardHistory32();archiveController?.stop();updateDownload?.cancel();updateTask?.cancel();for key in operationHotKeys.values { UnregisterEventHotKey(key) };fileOperationQueue.waitUntilAllOperationsAreFinished(); if let qaSuite { preferences.removePersistentDomain(forName:qaSuite) }; catalogQueue.cancelAllOperations(); ocrQueue.cancelAllOperations(); ocrSearchQueue.cancelAllOperations(); controlWake.disable(); directoryRepairQueue.cancelAllOperations(); if previewFixture != nil { directoryRepairQueue.waitUntilAllOperationsAreFinished(); ocrQueue.waitUntilAllOperationsAreFinished(); ocrSearchQueue.waitUntilAllOperationsAreFinished() }; stopWatching(); saveState(); if let fixture=previewFixture { try? FileManager.default.removeItem(at:fixture) } }
     func persistPins() { preferences.set(pinnedPaths,forKey:"pinnedPaths"); preferences.set(pinBookmarks,forKey:"pinBookmarks") }
     func makeBookmark(_ url:URL)->Data? { try? url.bookmarkData(options:[],includingResourceValuesForKeys:nil,relativeTo:nil) }
     func resolvePins() {
@@ -1587,9 +1582,10 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
             }
         }
     }
-    @objc func openActions() {
+    @objc func openActions() { openPalette32() }
+    func makeActionMenu32()->NSMenu {
         let menu=NSMenu(); let hasSelection=selected != nil
-        add31Actions(menu)
+        add32Actions(menu); add31Actions(menu)
         for (title,action) in [("重命名…",#selector(renameSelected)),("移动到文件夹…",#selector(moveSelected)),("移到废纸篓…",#selector(trashSelected)),("添加访达标签…",#selector(editFileTags))] { let item=NSMenuItem(title:title,action:action,keyEquivalent:""); item.target=self; item.isEnabled=hasSelection; menu.addItem(item) }
         let undo=NSMenuItem(title:fileUndos.last?.title ?? "撤销文件操作",action:#selector(undoFileOperation),keyEquivalent:""); undo.target=self; undo.isEnabled = !fileUndos.isEmpty; menu.addItem(undo)
         for (title,action) in [("按访达标签筛选…",#selector(chooseTagFilter)),("建立本地 OCR 索引…",#selector(chooseOCRFolder)),("取消 OCR",#selector(cancelOCR)),("清除本地 OCR 缓存",#selector(clearOCRCache)),("后台索引与资源…",#selector(resourceStatus))] { let item=NSMenuItem(title:title,action:action,keyEquivalent:""); item.target=self; menu.addItem(item) }
@@ -1618,7 +1614,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         let savedParent=NSMenuItem(title:"常用搜索",action:nil,keyEquivalent:""); savedParent.submenu=savedMenu; savedParent.isEnabled = !savedSearches.isEmpty; menu.addItem(savedParent)
         let remove=NSMenuItem(title:"移除常用搜索…",action:#selector(deleteSavedSearch),keyEquivalent:""); remove.target=self; remove.isEnabled = !savedSearches.isEmpty; menu.addItem(remove)
         for (label,action) in [("上一级文件夹",#selector(goUp)),("选择文件夹…",#selector(chooseFolder)),("最近修改",#selector(loadRecent)),("设置…",#selector(openSettings))] { let item=NSMenuItem(title:label,action:action,keyEquivalent:""); item.target=self; menu.addItem(item) }
-        presentMenu(menu,view:actionsButton)
+        return menu
     }
     @objc func showQuickLook() { quickLook() }
     @objc func loadRecent() {
@@ -1653,23 +1649,24 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
     }
     func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows flag:Bool)->Bool { show(); return true }
     func windowShouldClose(_ sender: NSWindow) -> Bool { recentSearchTimer?.invalidate(); saveState(); sender.orderOut(nil); return false }
-    @objc func about() { let a = NSAlert(); a.messageText = "KongFetch 3.1"; a.informativeText = "查找 · 预览 · 快捷唤起\n原生 macOS 文件工具\n\n默认快捷键：⌘⌥空格\n首次打开后请在设置中确认快捷键可用。"; a.runModal() }
+    @objc func about() { let a = NSAlert(); a.messageText = "KongFetch 3.2"; a.informativeText = "查找 · 预览 · 快捷唤起\n原生 macOS 文件工具\n\n默认快捷键：⌘⌥空格\n首次打开后请在设置中确认快捷键可用。"; a.runModal() }
     @objc func place(_ sender: NSButton) { scopeAll = sender.tag == 0; if scopeAll { stopQuery(); entries=[]; table.reloadData(); titleLabel.stringValue="全局搜索"; path.stringValue="Spotlight · 当前用户文件及应用程序"; status.stringValue="输入文件名开始搜索"; clearPreview(); window.makeFirstResponder(search); if !search.stringValue.isEmpty { startSearch() } } else { browse(URL(fileURLWithPath: sender.identifier!.rawValue)) } }
-    func stopQuery() { ocrSearchQueue.cancelAllOperations();ocrMatches=[];catalogToken=UUID(); catalogQueue.cancelAllOperations(); scanningNames=false; localMatches=[]; spotlightMatches=[]; catalogLimited=false; catalogUnreadable=0; cancelButton.isHidden=true; query?.stop(); query = nil; timer?.invalidate(); generation += 1; resetEvidence() }
-    func browse(_ url: URL, push: Bool = true) { savedScopeOverride=nil;
+    func stopQuery() { pendingNavigation32=nil;ocrSearchQueue.cancelAllOperations();ocrMatches=[];catalogToken=UUID(); catalogQueue.cancelAllOperations(); scanningNames=false; localMatches=[]; spotlightMatches=[]; catalogLimited=false; catalogUnreadable=0; cancelButton.isHidden=true; query?.stop(); query = nil; timer?.invalidate(); generation += 1; resetEvidence() }
+    func browse(_ url: URL, push: Bool = true) {
+        if push { pushNavigation32() }; savedScopeOverride=nil;
         defer { saveState() }
-        stopQuery(); localCollection=nil; collectionTabs.selectedSegment = -1; showingRecent=false; scopeAll = false; if push && url != folder { history.append(folder) }; folder = url; if scopePicker.numberOfItems > 7 { scopePicker.removeItem(at:7) }; scopePicker.addItem(withTitle:"文件夹："+url.lastPathComponent); scopePicker.selectItem(at:7); search.stringValue = ""; titleLabel.stringValue = url.lastPathComponent; path.stringValue = url.path; clearPreview()
+        stopQuery(); localCollection=nil; collectionTabs.selectedSegment = -1; showingRecent=false; scopeAll = false; folder = url; if scopePicker.numberOfItems > 7 { scopePicker.removeItem(at:7) }; scopePicker.addItem(withTitle:"文件夹："+url.lastPathComponent); scopePicker.selectItem(at:7); search.stringValue = ""; titleLabel.stringValue = url.lastPathComponent; path.stringValue = url.path; clearPreview()
         do { entries = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: [.isDirectoryKey,.fileSizeKey,.contentModificationDateKey], options: [.skipsHiddenFiles]).map(Entry.init).sorted { $0.directory != $1.directory ? $0.directory : $0.url.lastPathComponent.localizedStandardCompare($1.url.lastPathComponent) == .orderedAscending }; status.stringValue = "\(entries.count) 个项目 · 双击打开 · 空格快速预览" }
         catch { entries=[]; status.stringValue="无法读取此文件夹"; let a=NSAlert(); a.messageText="无法访问文件夹"; a.informativeText="\(error.localizedDescription)\n请在系统设置 → 隐私与安全性中检查文件访问权限，或选择其他文件夹。"; a.beginSheetModal(for: window) }
         browseEntries=entries; entries=browseEntries.filter(fileFilter.accepts).filter(acceptsDetails)
         refreshList(selectFirst:true)
     }
     @objc func chooseFolder() { let p=NSOpenPanel(); p.canChooseFiles=false; p.canChooseDirectories=true; p.allowsMultipleSelection=false; p.beginSheetModal(for:window) { [weak self] r in if r == .OK, let u=p.url { self?.browse(u) } } }
-    @objc func goBack() { if let u=history.popLast() { browse(u,push:false) } else { scopeAll=true; scopePicker.selectItem(at:searchRoots.count > 1 ? 1 : 0); loadRecent() } }
+    @objc func goBack() { if let snapshot=navigationHistory32.popLast() { restoreNavigation32(snapshot) } else { scopeAll=true; scopePicker.selectItem(at:searchRoots.count > 1 ? 1 : 0); loadRecent() } }
     @objc func goUp() { browse(folder.deletingLastPathComponent()) }
-    func controlTextDidChange(_ obj: Notification) { guard obj.object as? NSSearchField === search else { return }; recentSearchTimer?.invalidate(); stopQuery(); status.stringValue="等待输入完成…"; timer=Timer.scheduledTimer(withTimeInterval:0.25,repeats:false) { [weak self] _ in self?.startSearch() } }
+    func controlTextDidChange(_ obj: Notification) { guard obj.object as? NSSearchField === search else { return }; pendingNavigation32=nil; recentSearchTimer?.invalidate(); stopQuery(); status.stringValue="等待输入完成…"; timer=Timer.scheduledTimer(withTimeInterval:0.25,repeats:false) { [weak self] _ in self?.startSearch() } }
     func control(_ control:NSControl,textView:NSTextView,doCommandBy commandSelector:Selector)->Bool {
-        guard control === search,!menuTracking,window.attachedSheet == nil else { return false }
+        guard control === search,!menuTracking,window.attachedSheet == nil,!textView.hasMarkedText() else { return false }
         if commandSelector == #selector(NSResponder.moveDown(_:)), !entries.isEmpty {
             let row=table.selectedRow < 0 ? 0 : min(table.selectedRow+1,entries.count-1)
             table.selectRowIndexes(IndexSet(integer:row),byExtendingSelection:false); table.scrollRowToVisible(row); window.makeFirstResponder(table); return true
@@ -1678,19 +1675,15 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         return false
     }
     func startSearch() {
+        guard !isComposing32 else { status.stringValue="等待中文输入完成…"; return }; pendingNavigation32=nil
         stopQuery(); resolveSearchTargets()
         let term=search.stringValue.trimmingCharacters(in:.whitespacesAndNewlines)
         let input=SearchInput(term,fallback:fileFilter)
-        scheduleRecentSearch(term); updateFilterSummary()
+        scheduleRecentSearch(term)
         if term.isEmpty { loadRecent(); return }
-        localCollection=nil; collectionTabs.selectedSegment = -1; showingRecent=false; titleLabel.stringValue=searchMode == .content ? "正文匹配" : "搜索结果"
+        localCollection=nil; collectionTabs.selectedSegment = -1; showingRecent=false; titleLabel.stringValue=searchMode == .content ? "正文匹配" : "搜索结果";updateFilterSummary()
         let q=NSMetadataQuery(); q.searchScopes=activeSearchRoots
-        var predicates=input.words.map { word -> NSPredicate in
-            if searchMode == .filename,word.count >= 2,normalized(word).unicodeScalars.allSatisfy({ $0.isASCII }),!word.contains("*"),!word.contains("?") {
-                return NSPredicate(format:"%K LIKE[cd] %@",NSMetadataItemFSNameKey,"*"+word.map(String.init).joined(separator:"*")+"*")
-            }
-            return NSPredicate(format:"%K CONTAINS[cd] %@",searchMode.attribute,word)
-        }
+        var predicates=input.advanced.metadataPredicates(mode:searchMode,precision:precision)
         if let p=typePredicate(input.filter) { predicates.append(p) }; predicates += detailPredicates()
         q.predicate=predicates.isEmpty ? NSPredicate(value:true) : (predicates.count == 1 ? predicates[0] : NSCompoundPredicate(andPredicateWithSubpredicates:predicates)); q.sortDescriptors=[NSSortDescriptor(key:NSMetadataItemFSNameKey,ascending:true)]; query=q; entries=[]; refreshList(); clearPreview(); cancelButton.isHidden=false; status.stringValue="正在查找…"; emptyLabel.stringValue="正在搜索…"; if !q.start() { cancelButton.isHidden=true; status.stringValue="无法启动 Spotlight 搜索" }; if searchMode == .filename { startNameScan(input) } else { updateOCRMatches() }
     }
@@ -1706,7 +1699,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
             guard let operation,!operation.isCancelled else { return }
             func deliver(_ catalog:CatalogResult,complete:Bool,saveFailed:Bool=false) {
                 var matches:[Entry]=[]
-                for url in catalog.urls { if operation.isCancelled { return }; if !exclusions.contains(where:{ let path=canonicalIndexPath(url); let root=canonicalIndexPath(URL(fileURLWithPath:$0)); return path == root || path.hasPrefix(root+"/") }) && precision.score(url,words:input.words) != nil && FileManager.default.fileExists(atPath:url.path) { matches.append(Entry(url)) } }
+                for url in catalog.urls { if operation.isCancelled { return }; if !exclusions.contains(where:{ let path=canonicalIndexPath(url); let root=canonicalIndexPath(URL(fileURLWithPath:$0)); return path == root || path.hasPrefix(root+"/") }) && input.advanced.filenameScore(url,precision:precision) != nil && FileManager.default.fileExists(atPath:url.path) { matches.append(Entry(url)) } }
                 DispatchQueue.main.async { guard let self,self.generation == token,self.catalogToken == scanToken else { return }
                     if self.catalogCache.count >= 3 { self.catalogCache.removeAll() }; self.catalogCache[cacheKey]=(Date(),catalog)
                     if complete { self.validatedCatalogs.insert(cacheKey); self.reportIndex(self.catalogSummary(catalog)+(saveFailed ? "\n索引保存失败" : "")) }
@@ -1746,15 +1739,15 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         renderSearchResults()
     }
     func renderSearchResults() {
-        let previous=selected?.url; let previousURLs=selectedURLs; let limit=showingRecent ? 80 : 2000
+        let previous=selected?.url; let previousURLs=selectedURLs; let position32=ListPosition32(self); let limit=showingRecent ? 80 : 2000
         var unique:[String:Entry]=[:]; for e in spotlightMatches+localMatches+(searchMode == .content ? ocrMatches : []) { unique[e.url.path]=e }; entries=Array(unique.values)
         let input=SearchInput(search.stringValue,fallback:fileFilter)
-        for path in [currentAliasPath,manualSearchPath].compactMap({ $0 }) { let url=URL(fileURLWithPath:path),canonical=canonicalIndexPath(url); if FileManager.default.fileExists(atPath:path) && expandedRoots(activeSearchRoots).contains(where:{ let root=canonicalIndexPath($0); return canonical == root || canonical.hasPrefix(root+"/") }) { unique[path]=Entry(url); entries=Array(unique.values) } }
-        entries=entries.filter { !isExcluded($0.url) }
+        for path in (searchMode == .filename ? [currentAliasPath,manualSearchPath].compactMap({ $0 }) : []) { let url=URL(fileURLWithPath:path),canonical=canonicalIndexPath(url); if FileManager.default.fileExists(atPath:path) && expandedRoots(activeSearchRoots).contains(where:{ let root=canonicalIndexPath($0); return canonical == root || canonical.hasPrefix(root+"/") }) { unique[path]=Entry(url); entries=Array(unique.values) } }
+        entries=entries.filter { !isExcluded($0.url) && (showingRecent || input.advanced.acceptsURL($0.url,mode:searchMode,precision:precision)) }
         let effectiveFilter=showingRecent ? fileFilter : input.filter
         let natural=naturalQuery; entries=entries.filter(effectiveFilter.accepts).filter { acceptsDetails($0,natural:natural) }
         if showingRecent { entries.sort { ($0.modified ?? .distantPast) > ($1.modified ?? .distantPast) } }
-        if !showingRecent { entries=rankEntries(entries,words:searchMode == .content ? [] : input.words,counts:openCounts,preferredPath:rememberedSearchPath,manualPath:manualSearchPath,aliasPath:currentAliasPath,scoreProvider:searchMode == .filename ? { [precision] url,words in precision.score(url,words:words) } : nil) }
+        if !showingRecent { entries=rankEntries(entries,words:searchMode == .content ? [] : input.words,counts:openCounts,preferredPath:rememberedSearchPath,manualPath:manualSearchPath,aliasPath:currentAliasPath,scoreProvider:searchMode == .filename ? { [precision] url,_ in input.advanced.filenameScore(url,precision:precision) } : nil) }
         if !showingRecent,let key=searchChoiceKey {
             let rejected=Set((preferences.dictionary(forKey:"rejectedResults")?[key] as? [String]) ?? [])
             entries=entries.filter { !rejected.contains($0.url.path) } + entries.filter { rejected.contains($0.url.path) }
@@ -1768,6 +1761,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         if let previous, let row=entries.firstIndex(where: { $0.url == previous }) { table.selectRowIndexes(IndexSet(integer:row),byExtendingSelection:false) }
         else if !entries.isEmpty { table.selectRowIndexes(IndexSet(integer:0),byExtendingSelection:false) }
         if !previousURLs.isEmpty { let kept=previousURLs.filter { url in entries.contains { $0.url == url } }; if !kept.isEmpty { selectURLs(kept) } }
+        if let pending=pendingNavigation32 { pending.restore(self); if !scanningNames && query?.isGathering != true && ocrSearchQueue.operationCount == 0 { pendingNavigation32=nil } } else if !previousURLs.isEmpty { position32.restore(self) }
         tableViewSelectionDidChange(Notification(name:NSTableView.selectionDidChangeNotification))
         status.stringValue=showingRecent ? "最近修改 · \(entries.count) 个项目" : "\(entries.count) 个结果 · \(searchMode.title)\(matchedCount > limit ? "（已限制显示数量）" : "")\(searchMode == .content ? " · Spotlight／本地 OCR" : " · "+precision.title)"
         if scanningNames { status.stringValue += " · 正在更新文件索引" }; if catalogLimited { status.stringValue += " · 索引未完成" }; if catalogUnreadable > 0 { status.stringValue += " · 部分目录不可访问" }; if catalogSaveFailed { status.stringValue += " · 索引保存失败，本次仍可搜索" }; status.stringValue = (scopeAll ? "全用户" : "当前目录")+" · "+status.stringValue; status.toolTip="搜索范围："+activeSearchRoots.joined(separator:"\n")+"\n"+status.stringValue; cancelButton.isHidden = !(scanningNames || query?.isGathering == true)
@@ -1871,12 +1865,12 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
         else if NSWorkspace.shared.open(e.url) { recordOpen(e.url) }
         else { status.stringValue="无法打开此文件，请检查文件是否仍然存在" }
     }
-    var searchChoiceKey:String? {
-        guard !showingRecent,localCollection == nil else { return nil }
-        let words=SearchInput(search.stringValue,fallback:fileFilter).words.map(normalized)
+    var rawSearchChoiceKey32:String? {
+        let input=SearchInput(search.stringValue,fallback:fileFilter),words=input.words.map(normalized)
         guard !words.isEmpty else { return nil }
-        return "\(searchMode.rawValue):"+words.joined(separator:"\u{001F}")
+        return "\(searchMode.rawValue):"+words.joined(separator:"\u{001F}")+(input.advanced.hasConstraints ? "\u{001E}"+normalized(search.stringValue) : "")
     }
+    var searchChoiceKey:String? { guard !showingRecent,localCollection == nil else { return nil };return rawSearchChoiceKey32 }
     var rememberedSearchPath:String? {
         guard let key=searchChoiceKey else { return nil }
         return (preferences.dictionary(forKey:"searchChoices")?[key] as? [String:Any])?["path"] as? String
