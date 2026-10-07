@@ -394,8 +394,7 @@ final class ControlWakeMonitor {
             guard let self,!self.isListening else { return event }
             let flags=event.modifierFlags
             self.lastEvent=Date()
-            let unrelated=event.type == .flagsChanged && event.keyCode != 59 && event.keyCode != 62
-            if self.detector.update(control:flags.contains(.control),other:unrelated || !flags.intersection([.command,.option,.shift,.function]).isEmpty,key:event.type == .keyDown,time:event.timestamp) { self.lastWake=Date(); self.lastWakeWasGlobal=false; DispatchQueue.main.async { self.wake?() } }
+            if self.detector.update(control:flags.contains(.control),other:!flags.intersection([.command,.option,.shift,.function]).isEmpty,key:event.type == .keyDown,time:event.timestamp) { self.lastWake=Date(); self.lastWakeWasGlobal=false; DispatchQueue.main.async { self.wake?() } }
             return event
         }
         recoveryTimer=Timer(timeInterval:2,repeats:true) { [weak self] _ in self?.recover() }
@@ -428,9 +427,9 @@ final class ControlWakeMonitor {
             monitor.lastEvent=Date(); if !NSApp.isActive { monitor.lastBackgroundEvent=Date() }
             let flags=event.flags
             let other = !flags.intersection([.maskCommand,.maskAlternate,.maskShift,.maskSecondaryFn]).isEmpty
-            let code=event.getIntegerValueField(.keyboardEventKeycode)
-            let unrelatedModifier = type == .flagsChanged && code != 59 && code != 62
-            if monitor.detector.update(control:flags.contains(.maskControl),other:other || unrelatedModifier,key:type == .keyDown,time:Double(event.timestamp)/1_000_000_000) {
+            // Other modifiers are already rejected through `other`; no keycode filter, so a key remapped to Control (e.g. Caps Lock) still counts.
+            // Use the monotonic uptime clock rather than CGEvent.timestamp, whose units are not guaranteed to be nanoseconds on every Mac.
+            if monitor.detector.update(control:flags.contains(.maskControl),other:other,key:type == .keyDown,time:ProcessInfo.processInfo.systemUptime) {
                 monitor.lastWake=Date(); monitor.lastWakeWasGlobal = !NSApp.isActive; DispatchQueue.main.async { monitor.wake?() }
             }
             return Unmanaged.passUnretained(event)
@@ -1644,8 +1643,14 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
     }
     @objc func show() {
         if localCollection == 2 { loadLocalCollection(2) }; if window.isMiniaturized { window.deminiaturize(nil) }
-        window.collectionBehavior=[.moveToActiveSpace,.fullScreenAuxiliary]; window.makeKeyAndOrderFront(nil)
-        if #available(macOS 14,*) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps:true) }; window.makeFirstResponder(search)
+        window.collectionBehavior=[.moveToActiveSpace,.fullScreenAuxiliary]; window.makeKeyAndOrderFront(nil); window.orderFrontRegardless()
+        activateForWake(); window.makeFirstResponder(search)
+    }
+    // macOS 14's NSApp.activate() is only a request and may be declined when the trigger was observed by an event tap
+    // rather than delivered to this app (unlike the Carbon hot key). activate(ignoringOtherApps:true) still forces it.
+    func activateForWake() {
+        NSApp.activate(ignoringOtherApps:true)
+        if #available(macOS 14,*) { NSApp.activate() }
     }
     func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows flag:Bool)->Bool { show(); return true }
     func windowShouldClose(_ sender: NSWindow) -> Bool { recentSearchTimer?.invalidate(); saveState(); sender.orderOut(nil); return false }
@@ -2032,7 +2037,7 @@ final class App: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTable
     @objc func wakeDiagnostics() {
         let alert=NSAlert(); alert.messageText="唤起诊断"
         let date: (Date?) -> String = { $0.map { self.dateFormat.string(from:$0) } ?? "尚未收到" }
-        alert.informativeText="输入监控权限："+(CGPreflightListenEventAccess() ? "已允许" : "未允许")+"\n双 Control："+(controlWake.tap.map { CGEvent.tapIsEnabled(tap:$0) ? "正在监听" : "监听已暂停" } ?? "未启动")+"\n最近键盘事件："+date(controlWake.lastEvent)+"\n最近后台键盘事件："+date(controlWake.lastBackgroundEvent)+"\n最近双 Control："+date(controlWake.lastWake)+"（"+(controlWake.lastWakeWasGlobal ? "其他应用前台" : "本应用前台／备用识别")+"）\n"+wakeReport+"\n版本：3.1 · "+Bundle.main.bundleURL.path+"\n组合快捷键："+(hotKey == nil ? "注册失败" : "已注册")+"\n目录快捷键：\(directoryHotKeys.count) 个有效\n"+directoryShortcutErrors.joined(separator:"\n")+"\n\n点击测试后关闭窗口，再连按两次 Control。随后会显示收到事件、窗口可见、输入焦点三项结果。"
+        alert.informativeText="输入监控权限："+(CGPreflightListenEventAccess() ? "已允许" : "未允许")+"\n双 Control："+(controlWake.tap.map { CGEvent.tapIsEnabled(tap:$0) ? "正在监听" : "监听已暂停" } ?? "未启动")+"\n最近键盘事件："+date(controlWake.lastEvent)+"\n最近后台键盘事件："+date(controlWake.lastBackgroundEvent)+"\n最近双 Control："+date(controlWake.lastWake)+"（"+(controlWake.lastWakeWasGlobal ? "其他应用前台" : "本应用前台／备用识别")+"）\n"+wakeReport+"\n版本："+((Bundle.main.object(forInfoDictionaryKey:"CFBundleShortVersionString") as? String) ?? "?")+" · "+Bundle.main.bundleURL.path+"\n组合快捷键："+(hotKey == nil ? "注册失败" : "已注册")+"\n目录快捷键：\(directoryHotKeys.count) 个有效\n"+directoryShortcutErrors.joined(separator:"\n")+"\n\n点击测试后关闭窗口，再连按两次 Control。随后会显示收到事件、窗口可见、输入焦点三项结果。"
         alert.addButton(withTitle:"测试双 Control"); alert.addButton(withTitle:"关闭"); alert.addButton(withTitle:"授权／重新检测")
         alert.beginSheetModal(for:window) { [weak self] response in guard let self else { return }
             if response == .alertFirstButtonReturn {

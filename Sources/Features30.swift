@@ -249,7 +249,9 @@ extension App {
     }
     func triggerControlWake() {
         wakeReceived=Date(); show(); let token=UUID(); wakeCheckToken=token
-        DispatchQueue.main.asyncAfter(deadline:.now()+0.2) { [weak self] in guard let self,self.wakeCheckToken == token else { return }; self.wakeWindowVisible=self.window.isVisible && !self.window.isMiniaturized; self.wakeInputFocused=self.window.isKeyWindow && ((self.window.firstResponder as? NSTextView)?.delegate as? NSSearchField === self.search || self.window.firstResponder === self.search)
+        // One retry if the system has not handed over key focus yet.
+        DispatchQueue.main.asyncAfter(deadline:.now()+0.1) { [weak self] in guard let self,self.wakeCheckToken == token,!self.window.isKeyWindow else { return }; self.activateForWake(); self.window.makeKeyAndOrderFront(nil); self.window.makeFirstResponder(self.search) }
+        DispatchQueue.main.asyncAfter(deadline:.now()+0.3) { [weak self] in guard let self,self.wakeCheckToken == token else { return }; self.wakeWindowVisible=self.window.isVisible && !self.window.isMiniaturized; self.wakeInputFocused=self.window.isKeyWindow && ((self.window.firstResponder as? NSTextView)?.delegate as? NSSearchField === self.search || self.window.firstResponder === self.search)
             self.wakeReport="收到双 Control：是 · 窗口："+(self.wakeWindowVisible ? "可见" : "未出现")+" · 输入焦点："+(self.wakeInputFocused ? "已获得" : "未获得")
             if self.wakeTesting { if !self.controlWake.lastWakeWasGlobal { self.wakeReport += " · 本应用前台测试，请切换到其他应用验证全局唤起" }; self.status.stringValue=self.wakeReport; self.wakeTesting=false }
         }
@@ -305,7 +307,7 @@ extension App {
                         precondition(self.entries.count == 2)
                         self.preferences.set([fixture.path],forKey:"excludedSearchRoots"); self.renderSearchResults(); precondition(self.entries.isEmpty); self.preferences.removeObject(forKey:"excludedSearchRoots")
                         self.show(); self.triggerControlWake()
-                        DispatchQueue.main.asyncAfter(deadline:.now()+0.4) {
+                        DispatchQueue.main.asyncAfter(deadline:.now()+0.6) {
                         precondition(self.wakeReceived != nil && self.wakeWindowVisible && !self.wakeReport.isEmpty)
                         print("PASS 3.0: natural date/size/type/tag parsing; move/rename undo and conflict protection; Finder tags; real Chinese image and scanned PDF OCR, disk cache and cancellation; OCR result/exclusion guards; resource policy; wake event/window/focus stages; fixed window"); fflush(stdout); NSApp.terminate(nil)
                         }
