@@ -3,3 +3,7 @@ build/
 .build/
 .swiftpm/
 *.swift.backup
+Core/.build/
+Core/.logs/
+Core/.swiftpm/
+Core/Package.resolved
