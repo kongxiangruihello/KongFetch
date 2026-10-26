@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run on a Mac: update this branch, then build/test or benchmark the Core package.
+# Run on a Mac: build/test or benchmark the Core package (code is synced separately).
 # Output goes to Core/.logs/ so it can be read afterwards.
 #   bash Core/scripts/mac-test.sh test    build + swift test
 #   bash Core/scripts/mac-test.sh bench   synthetic 300k-file tree, new vs 3.2
@@ -18,7 +18,6 @@ if [ "$step" = "all" ]; then
   exit 0
 fi
 echo "running: $step $(date '+%F %T')" > "$logs/status.txt"
-git -C "$core/.." pull --ff-only > "$logs/pull.log" 2>&1
 { sw_vers; swift --version; } > "$logs/env.log" 2>&1
 
 case "$step" in
