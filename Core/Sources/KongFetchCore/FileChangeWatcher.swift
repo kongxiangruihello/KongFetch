@@ -88,7 +88,8 @@ public final class FileChangeWatcher {
     /// If it differs from the one saved with the index, old event ids are meaningless.
     public static func eventDatabaseUUID(forPath path: String) -> String? {
         var info = stat()
-        guard stat(path, &info) == 0, let uuid = FSEventsCopyUUIDForDevice(info.st_dev)?.takeRetainedValue() else { return nil }
+        // Recent SDKs return a managed CFUUID (older ones an Unmanaged value).
+        guard stat(path, &info) == 0, let uuid = FSEventsCopyUUIDForDevice(info.st_dev) else { return nil }
         guard let text = CFUUIDCreateString(nil, uuid) else { return nil }
         return text as String
     }
