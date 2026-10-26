@@ -12,8 +12,8 @@ step="${1:-test}"
 say() { echo "[KongFetchCore] $*"; }
 cd "$core" || exit 1
 if [ "$step" = "all" ]; then
-  bash "$0" test
-  if grep -q '^exit 0$' "$logs/build.log"; then bash "$0" bench; fi
+  bash "$core/scripts/mac-test.sh" test
+  if grep -q '^exit 0$' "$logs/build.log"; then bash "$core/scripts/mac-test.sh" bench; fi
   say "全部完成，结果在 $logs ，可以回到 Claude 了。"
   exit 0
 fi
