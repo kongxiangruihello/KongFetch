@@ -58,6 +58,8 @@ case "new":
     let base = footprintMB()
     let (index, buildTime) = milliseconds { NameIndex.build(roots: [root], rules: .legacy32) }
     report("new.build.ms", format(buildTime))
+    report("new.build.scan.ms", format(index.buildTimings.scanMilliseconds))
+    report("new.build.derive.ms", format(index.buildTimings.deriveMilliseconds))
     report("new.entries", index.entryCount)
     report("new.folders", index.directoryCount)
     report("new.memory.mb", format(footprintMB() - base))
@@ -83,6 +85,17 @@ case "new":
             }
             report("new.query.\(precision).\(words.joined(separator: "+"))", "\(format(median(times))) ms, \(hits) hits")
         }
+    }
+    for text in ["ext:pdf 合同", "\"年度报告\" -草稿", "-ext:jpg,png report 2024", "最近一周的 PDF"] {
+        let query = SearchQuery(text)
+        var times: [Double] = []
+        var hits = 0
+        for _ in 0..<5 {
+            let (result, time) = milliseconds { index.search(query, precision: .withPath) }
+            times.append(time)
+            hits = result.count
+        }
+        report("new.advanced.withPath.\(text)", "\(format(median(times))) ms, \(hits) hits")
     }
     let session = SearchSession(index: index)
     let (_, typedWithSession) = milliseconds { for words in typing { _ = session.search(words) } }

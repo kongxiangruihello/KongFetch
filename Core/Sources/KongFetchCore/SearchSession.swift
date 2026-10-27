@@ -33,6 +33,17 @@ public final class SearchSession {
         return hits
     }
 
+    /// Search-box query. Narrowing applies to plain word queries; queries with
+    /// phrases, exclusions or ext: filters are searched in full (still milliseconds).
+    public func search(_ query: SearchQuery, precision: MatchPrecision = .fuzzyName) -> [SearchHit] {
+        if query.valid && !query.hasConstraints && !query.words.isEmpty {
+            return search(query.words, precision: precision)
+        }
+        reset()
+        lastSearchNarrowed = false
+        return index.search(query, precision: precision)
+    }
+
     public func reset() {
         previousGeneration = -1
         previousHits = []

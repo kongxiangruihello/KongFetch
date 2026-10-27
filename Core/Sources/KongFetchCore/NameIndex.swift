@@ -40,6 +40,13 @@ public struct UpdateSummary: Equatable, Sendable {
     public var foldersRescanned = 0
 }
 
+public struct BuildTimings: Equatable, Sendable {
+    /// Reading folders from disk.
+    public var scanMilliseconds: Double = 0
+    /// Folding names and computing pinyin.
+    public var deriveMilliseconds: Double = 0
+}
+
 public struct BuildProgress: Sendable {
     public var entries: Int
     public var currentFolder: String
@@ -67,6 +74,8 @@ public final class NameIndex {
     public internal(set) var generation = 0
     public internal(set) var unreadableCount = 0
     public internal(set) var unreadableSamples: [String] = []
+    /// Where the last full build spent its time (milliseconds).
+    public internal(set) var buildTimings = BuildTimings()
 
     // Columns, indexed by entry id.
     var names = ByteColumn()
@@ -95,6 +104,7 @@ public final class NameIndex {
     // MARK: - Building
 
     /// Scans `roots` and returns a complete index (or a partial one if cancelled).
+    /// Folders are read in parallel; pass a `throttle` that sleeps to slow it down.
     public static func build(
         roots rawRoots: [String],
         rules: ExclusionRules = .standard(),
@@ -110,6 +120,7 @@ public final class NameIndex {
 
         let index = NameIndex(roots: canonicalRoots, rules: rules)
         let compiled = rules.compiled()
+        let scanStart = DispatchTime.now().uptimeNanoseconds
         for root in canonicalRoots where !compiled.paths.contains(root) {
             let id = index.appendEntry(name: root, parent: -1, flags: [.directory, .root], deriveInline: false)
             if !index.scanSubtree(of: id, rules: compiled, progress: progress, throttle: throttle, isCancelled: isCancelled) {
@@ -117,12 +128,21 @@ public final class NameIndex {
                 break
             }
         }
+        let deriveStart = DispatchTime.now().uptimeNanoseconds
         index.computeDerivedColumns()
+        let end = DispatchTime.now().uptimeNanoseconds
+        index.buildTimings = BuildTimings(
+            scanMilliseconds: Double(deriveStart - scanStart) / 1_000_000,
+            deriveMilliseconds: Double(end - deriveStart) / 1_000_000
+        )
         index.updated = Date()
         return index
     }
 
-    /// Depth-first scan below an indexed folder. Returns false if cancelled.
+    /// Scans below an indexed folder one depth level at a time: all folders of a
+    /// level are read in parallel (directory listing, exclusions, package checks),
+    /// then appended in order, so each folder's children stay contiguous.
+    /// Returns false if cancelled.
     @discardableResult
     func scanSubtree(
         of startID: Int32,
@@ -131,27 +151,43 @@ public final class NameIndex {
         throttle: (() -> Void)? = nil,
         isCancelled: () -> Bool = { false }
     ) -> Bool {
-        var stack: [Int32] = [startID]
+        var level: [Int32] = [startID]
         var lastReported = flags.count
-        while let directoryID = stack.popLast() {
+        while !level.isEmpty {
             if isCancelled() { return false }
             throttle?()
-            guard let path = directoryPaths[directoryID] else { continue }
-            guard let items = DirectoryReader.children(of: path) else {
-                noteUnreadable(path)
-                continue
+            let paths = level.map { directoryPaths[$0] ?? "" }
+            var listings = [[(name: String, kind: EntryFlags)]?](repeating: nil, count: level.count)
+            listings.withUnsafeMutableBufferPointer { output in
+                DispatchQueue.concurrentPerform(iterations: paths.count) { k in
+                    let path = paths[k]
+                    guard !path.isEmpty, let items = DirectoryReader.children(of: path) else { return }
+                    var listing: [(name: String, kind: EntryFlags)] = []
+                    listing.reserveCapacity(items.count)
+                    for item in items {
+                        let childPath = Paths.join(path, item.name)
+                        if rules.skips(name: item.name, path: childPath) { continue }
+                        listing.append((item.name, Self.classify(item, path: childPath, rules: rules)))
+                    }
+                    output[k] = listing
+                }
             }
-            for item in items {
-                let childPath = Paths.join(path, item.name)
-                if rules.skips(name: item.name, path: childPath) { continue }
-                let kind = Self.classify(item, path: childPath, rules: rules)
-                let id = appendEntry(name: item.name, parent: directoryID, flags: kind, deriveInline: derivedReady)
-                if kind.contains(.directory) { stack.append(id) }
+            var next: [Int32] = []
+            for (k, directoryID) in level.enumerated() {
+                guard let listing = listings[k] else {
+                    noteUnreadable(paths[k])
+                    continue
+                }
+                for child in listing {
+                    let id = appendEntry(name: child.name, parent: directoryID, flags: child.kind, deriveInline: derivedReady)
+                    if child.kind.contains(.directory) { next.append(id) }
+                }
+                if let progress, flags.count - lastReported >= 8192 {
+                    lastReported = flags.count
+                    progress(BuildProgress(entries: flags.count - deletedCount, currentFolder: paths[k]))
+                }
             }
-            if let progress, flags.count - lastReported >= 8192 {
-                lastReported = flags.count
-                progress(BuildProgress(entries: flags.count - deletedCount, currentFolder: path))
-            }
+            level = next
         }
         return true
     }
@@ -380,7 +416,21 @@ public final class NameIndex {
     /// given precision. Pass `candidates` to search only a previous result set.
     public func search(_ rawWords: [String], precision: MatchPrecision = .fuzzyName, within candidates: [Int32]? = nil) -> [SearchHit] {
         let words = rawWords.filter { !$0.isEmpty }
-        guard !words.isEmpty, derivedReady else { return [] }
+        guard !words.isEmpty else { return [] }
+        return scan(words: words, precision: precision, within: candidates, constraints: nil)
+    }
+
+    /// Full search-box query: words plus "phrases", -exclusions and ext: filters,
+    /// scored like 3.2 `AdvancedSearchQuery.filenameScore`. Type, date, size and
+    /// tag filters need file attributes; apply `query.acceptsMetadata` to the hits.
+    /// A query with no words matches every entry that passes its filters (score 0).
+    public func search(_ query: SearchQuery, precision: MatchPrecision = .fuzzyName, within candidates: [Int32]? = nil) -> [SearchHit] {
+        guard query.valid else { return [] }
+        return scan(words: query.words, precision: precision, within: candidates, constraints: QueryConstraints(query: query, precision: precision))
+    }
+
+    private func scan(words: [String], precision: MatchPrecision, within candidates: [Int32]?, constraints: QueryConstraints?) -> [SearchHit] {
+        guard derivedReady else { return [] }
         let prepared = words.map(PreparedWord.init)
         let gates = prepared.map(\.gate)
         let phrase = PreparedWord(words.joined(separator: " "))
@@ -394,6 +444,8 @@ public final class NameIndex {
         let folderPaths = foldedDirectoryPaths
         let skipMask = EntryFlags.deleted.rawValue | EntryFlags.root.rawValue
         let asciiBit = EntryFlags.asciiName.rawValue
+        let directoryBit = EntryFlags.directory.rawValue
+        let packageBit = EntryFlags.package.rawValue
         let exactScore = 2000 * wordCount
         let candidateList = candidates ?? []
         let useCandidates = candidates != nil
@@ -417,6 +469,7 @@ public final class NameIndex {
                     var memoScore = [Int?](repeating: nil, count: wordCount)
                     var parentBytes: [UInt8] = []
                     var parentASCII = true
+                    var pathBuffer: [UInt8] = []
                     let start = chunk * chunkSize, end = min(total, start + chunkSize)
                     for position in start..<end {
                         let id = useCandidates ? Int(candidatePointer[position]) : position
@@ -424,54 +477,81 @@ public final class NameIndex {
                         if flag & skipMask != 0 { continue }
                         let name = nameView[id]
                         let stem = UnsafeBufferPointer(rebasing: name[0..<min(name.count, Int(stemPointer[id]))])
-                        if ByteMatch.equals(name, phraseBytes) || ByteMatch.equals(stem, phraseBytes) {
-                            hits.append(SearchHit(id: Int32(id), score: exactScore))
-                            continue
-                        }
-                        if precision == .exactName { continue }
-                        let nameASCII = flag & asciiBit != 0
-                        var score = 0
-                        var matched = true
-                        for w in 0..<wordCount {
-                            let gate = gates[w]
-                            let wordBytes = buffers.buffer(w)
-                            if let s = Scoring.fuzzy(name, textIsASCII: nameASCII, allowsSubsequence: gate.allowsSubsequence, wordBytes: wordBytes) {
-                                score += s + 200
-                                continue
-                            }
-                            if precision == .withPath {
-                                if gate.allowsPathMatch {
+
+                        // ext:, "phrase" and -exclusion filters (3.2 acceptsURL).
+                        if let constraints {
+                            let isFolder = flag & directoryBit != 0 && flag & packageBit == 0
+                            if !constraints.acceptsExtension(name: name, isFolder: isFolder) { continue }
+                            if constraints.filtersText {
+                                let accepted: Bool
+                                if constraints.usesPath {
                                     let parent = parentPointer[id]
-                                    if parent != memoParent {
-                                        memoParent = parent
-                                        for k in 0..<wordCount { memoDone[k] = false }
-                                        parentBytes = folderPaths[parent] ?? []
-                                        parentASCII = parentBytes.allSatisfy { $0 < 0x80 }
-                                    }
-                                    if !memoDone[w] {
-                                        memoDone[w] = true
-                                        memoScore[w] = parentBytes.withUnsafeBufferPointer {
-                                            Scoring.fuzzy($0, textIsASCII: parentASCII, allowsSubsequence: gate.allowsSubsequence, wordBytes: wordBytes)
-                                        }
-                                    }
-                                    if let s = memoScore[w] {
-                                        score += min(350, s / 2)
-                                        continue
-                                    }
+                                    let base = folderPaths[parent] ?? []
+                                    pathBuffer.removeAll(keepingCapacity: true)
+                                    pathBuffer.append(contentsOf: base)
+                                    if base != [0x2F] { pathBuffer.append(0x2F) }
+                                    pathBuffer.append(contentsOf: name)
+                                    accepted = pathBuffer.withUnsafeBufferPointer { constraints.acceptsText($0) }
+                                } else {
+                                    accepted = constraints.acceptsText(name)
                                 }
-                                if gate.allowsPathModePinyin,
-                                   let s = Scoring.pinyin(full: fullView[id], initials: initialsView[id], allowsPinyin: true, wordBytes: wordBytes) {
-                                    score += min(600, s)
+                                if !accepted { continue }
+                            }
+                        }
+
+                        var base: Int?
+                        if wordCount == 0 {
+                            base = 0
+                        } else if ByteMatch.equals(name, phraseBytes) || ByteMatch.equals(stem, phraseBytes) {
+                            base = exactScore
+                        } else if precision != .exactName {
+                            let nameASCII = flag & asciiBit != 0
+                            var score = 0
+                            var matched = true
+                            for w in 0..<wordCount {
+                                let gate = gates[w]
+                                let wordBytes = buffers.buffer(w)
+                                if let s = Scoring.fuzzy(name, textIsASCII: nameASCII, allowsSubsequence: gate.allowsSubsequence, wordBytes: wordBytes) {
+                                    score += s + 200
                                     continue
                                 }
-                            } else if let s = Scoring.pinyin(full: fullView[id], initials: initialsView[id], allowsPinyin: gate.allowsPinyin, wordBytes: wordBytes) {
-                                score += s
-                                continue
+                                if precision == .withPath {
+                                    if gate.allowsPathMatch {
+                                        let parent = parentPointer[id]
+                                        if parent != memoParent {
+                                            memoParent = parent
+                                            for k in 0..<wordCount { memoDone[k] = false }
+                                            parentBytes = folderPaths[parent] ?? []
+                                            parentASCII = parentBytes.allSatisfy { $0 < 0x80 }
+                                        }
+                                        if !memoDone[w] {
+                                            memoDone[w] = true
+                                            memoScore[w] = parentBytes.withUnsafeBufferPointer {
+                                                Scoring.fuzzy($0, textIsASCII: parentASCII, allowsSubsequence: gate.allowsSubsequence, wordBytes: wordBytes)
+                                            }
+                                        }
+                                        if let s = memoScore[w] {
+                                            score += min(350, s / 2)
+                                            continue
+                                        }
+                                    }
+                                    if gate.allowsPathModePinyin,
+                                       let s = Scoring.pinyin(full: fullView[id], initials: initialsView[id], allowsPinyin: true, wordBytes: wordBytes) {
+                                        score += min(600, s)
+                                        continue
+                                    }
+                                } else if let s = Scoring.pinyin(full: fullView[id], initials: initialsView[id], allowsPinyin: gate.allowsPinyin, wordBytes: wordBytes) {
+                                    score += s
+                                    continue
+                                }
+                                matched = false
+                                break
                             }
-                            matched = false
-                            break
+                            if matched { base = score }
                         }
-                        if matched { hits.append(SearchHit(id: Int32(id), score: score)) }
+                        guard var score = base else { continue }
+                        if let constraints { score += constraints.phraseBonus(name: name, stem: stem) }
+                        hits.append(SearchHit(id: Int32(id), score: score))
                     }
                     output[chunk] = hits
                 }
@@ -485,6 +565,57 @@ public final class NameIndex {
         let sorted = hits.sorted { $0.score != $1.score ? $0.score > $1.score : $0.id < $1.id }
         if let limit, sorted.count > limit { return Array(sorted.prefix(limit)) }
         return sorted
+    }
+}
+
+/// Byte forms of a query's ext:, phrase and exclusion filters.
+final class QueryConstraints {
+    let extensions: [[UInt8]]
+    let excludedExtensions: [[UInt8]]
+    let phrases: [[UInt8]]
+    let excluded: [[UInt8]]
+    /// Name-and-path mode checks phrases and exclusions against the whole path.
+    let usesPath: Bool
+
+    init(query: SearchQuery, precision: MatchPrecision) {
+        extensions = query.extensions.sorted().map { Array(("." + $0).utf8) }
+        excludedExtensions = query.excludedExtensions.sorted().map { Array(("." + $0).utf8) }
+        phrases = query.phrases.map { Array(SearchText.fold($0).utf8) }
+        excluded = query.excluded.map { Array(SearchText.fold($0).utf8) }
+        usesPath = precision == .withPath
+    }
+
+    var filtersText: Bool { !phrases.isEmpty || !excluded.isEmpty }
+
+    /// 3.2: a folder passes only when no positive extension is required.
+    func acceptsExtension(name: UnsafeBufferPointer<UInt8>, isFolder: Bool) -> Bool {
+        if extensions.isEmpty && excludedExtensions.isEmpty { return true }
+        if isFolder { return extensions.isEmpty }
+        if !extensions.isEmpty && !extensions.contains(where: { Self.hasSuffix(name, $0) }) { return false }
+        return !excludedExtensions.contains { Self.hasSuffix(name, $0) }
+    }
+
+    func acceptsText(_ haystack: UnsafeBufferPointer<UInt8>) -> Bool {
+        phrases.allSatisfy { Self.contains(haystack, $0) } && !excluded.contains { Self.contains(haystack, $0) }
+    }
+
+    /// 3.2: +2000 when a phrase is the whole name, +1000 inside the name, +400 elsewhere in the path.
+    func phraseBonus(name: UnsafeBufferPointer<UInt8>, stem: UnsafeBufferPointer<UInt8>) -> Int {
+        var bonus = 0
+        for phrase in phrases {
+            let whole = phrase.withUnsafeBufferPointer { ByteMatch.equals(name, $0) || ByteMatch.equals(stem, $0) }
+            bonus += whole ? 2000 : (Self.contains(name, phrase) ? 1000 : 400)
+        }
+        return bonus
+    }
+
+    static func contains(_ text: UnsafeBufferPointer<UInt8>, _ pattern: [UInt8]) -> Bool {
+        pattern.withUnsafeBufferPointer { ByteMatch.firstIndex(of: $0, in: text) != nil }
+    }
+
+    static func hasSuffix(_ text: UnsafeBufferPointer<UInt8>, _ suffix: [UInt8]) -> Bool {
+        guard suffix.count <= text.count else { return false }
+        return suffix.withUnsafeBufferPointer { ByteMatch.equals(UnsafeBufferPointer(rebasing: text[(text.count - $0.count)...]), $0) }
     }
 }
 
