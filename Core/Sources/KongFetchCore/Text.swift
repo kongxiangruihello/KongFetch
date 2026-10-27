@@ -37,15 +37,139 @@ public enum Pinyin {
     }()
 
     /// `[full spelling, initials]` for a name containing CJK characters, `[]` otherwise.
-    /// Matches 3.2 `pinyinForms(_:)`.
+    /// Same result as 3.2 `pinyinForms(_:)`.
     public static func forms(_ name: String) -> [String] {
+        var cache = SyllableCache()
+        return forms(name, cache: &cache)
+    }
+
+    /// As `forms(_:)`, reusing a caller-owned syllable cache (one per worker thread).
+    static func forms(_ name: String, cache: inout SyllableCache) -> [String] {
         guard SearchText.containsCJK(name) else { return [] }
-        var latin = SearchText.fold(name.applyingTransform(.toLatin, reverse: false) ?? name)
+        return finish(name, latin: fastLatin(name, cache: &cache) ?? transformLatin(name))
+    }
+
+    public struct FastPathReport: Sendable {
+        public var namesWithCJK = 0
+        public var slowPathNames = 0
+        public var mismatches: [String] = []
+    }
+
+    /// Compares the per-character path with whole-name transliteration for every
+    /// name (in parallel). Used by tests and the benchmark; not needed at runtime.
+    public static func verifyFastPath(_ names: [String]) -> FastPathReport {
+        final class Part { var report = FastPathReport() }
+        let chunkSize = 2048
+        let chunkCount = max(1, (names.count + chunkSize - 1) / chunkSize)
+        let parts = (0..<chunkCount).map { _ in Part() }
+        DispatchQueue.concurrentPerform(iterations: chunkCount) { c in
+            let part = parts[c]
+            var cache = SyllableCache()
+            for name in names[(c * chunkSize)..<min(names.count, (c + 1) * chunkSize)] where SearchText.containsCJK(name) {
+                part.report.namesWithCJK += 1
+                guard let latin = fastLatin(name, cache: &cache) else {
+                    part.report.slowPathNames += 1
+                    continue
+                }
+                if finish(name, latin: latin) != slowForms(name), part.report.mismatches.count < 50 {
+                    part.report.mismatches.append(name + " → fast " + latin + " / transform " + transformLatin(name))
+                }
+            }
+        }
+        var total = FastPathReport()
+        for part in parts {
+            total.namesWithCJK += part.report.namesWithCJK
+            total.slowPathNames += part.report.slowPathNames
+            total.mismatches += part.report.mismatches
+        }
+        return total
+    }
+
+    /// 3.2's method: transliterate the whole name with the system's Any-Latin transform.
+    static func slowForms(_ name: String) -> [String] {
+        guard SearchText.containsCJK(name) else { return [] }
+        return finish(name, latin: transformLatin(name))
+    }
+
+    static func transformLatin(_ name: String) -> String {
+        SearchText.fold(name.applyingTransform(.toLatin, reverse: false) ?? name)
+    }
+
+    private static func finish(_ name: String, latin source: String) -> [String] {
+        var latin = source
         for item in phraseReadings where name.contains(item.phrase) {
             latin = latin.replacingOccurrences(of: item.latin, with: item.reading)
         }
         let parts = latin.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
         return [parts.joined(), String(parts.compactMap(\.first))]
+    }
+
+    /// Builds the same folded Latin text as `transformLatin`, from per-character
+    /// syllables: the system transform reads each Han character on its own and
+    /// separates consecutive syllables with a space. Only names made of Han
+    /// characters, Latin letters, digits, punctuation, symbols and spaces take
+    /// this path; anything else (kana, hangul, other scripts) returns nil and is
+    /// transliterated whole. The tests compare both paths on thousands of names.
+    static func fastLatin(_ name: String, cache: inout SyllableCache) -> String? {
+        var result = String.UnicodeScalarView()
+        var previousWasHan = false
+        for scalar in name.unicodeScalars {
+            let value = scalar.value
+            if (0x3400...0x9fff).contains(value) {
+                guard let syllable = cache.syllable(for: scalar) else { return nil }
+                if previousWasHan { result.append(" ") }
+                result.append(contentsOf: syllable.unicodeScalars)
+                previousWasHan = true
+            } else if isNeutral(scalar) {
+                result.append(scalar)
+                previousWasHan = false
+            } else {
+                return nil
+            }
+        }
+        return SearchText.fold(String(result))
+    }
+
+    /// Characters the Any-Latin transform leaves as they are (up to folding).
+    private static func isNeutral(_ scalar: Unicode.Scalar) -> Bool {
+        let value = scalar.value
+        if value < 0x250 { return true } // ASCII, Latin-1, Latin Extended-A/B
+        if (0x3000...0x303F).contains(value) || (0xFF00...0xFFEF).contains(value) { return false } // CJK/fullwidth punctuation: transform may rewrite
+        switch scalar.properties.generalCategory {
+        case .spaceSeparator, .connectorPunctuation, .dashPunctuation, .openPunctuation, .closePunctuation,
+             .initialPunctuation, .finalPunctuation, .otherPunctuation, .mathSymbol, .currencySymbol, .otherSymbol:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Folded syllable per Han character, shared across threads behind a lock and
+    /// copied into a per-thread dictionary so the lock is rarely taken.
+    struct SyllableCache {
+        private var local: [Unicode.Scalar: String] = [:]
+        private static let lock = NSLock()
+        private static var shared: [Unicode.Scalar: String] = [:]
+
+        mutating func syllable(for scalar: Unicode.Scalar) -> String? {
+            if let hit = local[scalar] { return hit.isEmpty ? nil : hit }
+            Self.lock.lock()
+            var value = Self.shared[scalar]
+            Self.lock.unlock()
+            if value == nil {
+                let text = String(Character(scalar))
+                let latin = SearchText.fold(text.applyingTransform(.toLatin, reverse: false) ?? text)
+                // A syllable must be plain letters; otherwise remember "" and let the
+                // whole name take the slow path.
+                let usable = !latin.isEmpty && latin.unicodeScalars.allSatisfy { $0.isASCII && $0.properties.isAlphabetic }
+                value = usable ? latin : ""
+                Self.lock.lock()
+                Self.shared[scalar] = value
+                Self.lock.unlock()
+            }
+            local[scalar] = value
+            return value!.isEmpty ? nil : value
+        }
     }
 }
 

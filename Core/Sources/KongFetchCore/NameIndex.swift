@@ -239,7 +239,7 @@ public final class NameIndex {
 
     /// Search keys for one name: folded name, folded length of the name without
     /// extension (3.2 compares both against the whole query), and pinyin forms.
-    static func derive(name: String, isRoot: Bool) -> Derived {
+    static func derive(name: String, isRoot: Bool, cache: inout Pinyin.SyllableCache) -> Derived {
         let foldedName = SearchText.fold(name)
         let foldedCount = foldedName.utf8.count
         var stemLength = foldedCount
@@ -254,7 +254,7 @@ public final class NameIndex {
                 stemLength = suffix.allSatisfy({ $0 < 0x80 }) ? foldedCount - suffix.count : SearchText.fold(stem).utf8.count
             }
         }
-        let forms = isRoot ? [] : Pinyin.forms(stem)
+        let forms = isRoot ? [] : Pinyin.forms(stem, cache: &cache)
         return Derived(
             folded: foldedName,
             stemLength: UInt16(clamping: max(0, stemLength)),
@@ -266,7 +266,8 @@ public final class NameIndex {
 
     private func appendDerived(for id: Int32) {
         let i = Int(id)
-        let derived = Self.derive(name: names.string(at: i), isRoot: flags[i] & EntryFlags.root.rawValue != 0)
+        var cache = Pinyin.SyllableCache()
+        let derived = Self.derive(name: names.string(at: i), isRoot: flags[i] & EntryFlags.root.rawValue != 0, cache: &cache)
         folded.append(derived.folded)
         pinyinFull.append(derived.pinyinFull)
         pinyinInitials.append(derived.pinyinInitials)
@@ -305,8 +306,9 @@ public final class NameIndex {
             let chunk = chunks[c]
             let start = c * chunkSize, end = min(total, start + chunkSize)
             guard start < end else { return }
+            var cache = Pinyin.SyllableCache()
             for i in start..<end {
-                let d = NameIndex.derive(name: nameSnapshot.string(at: i), isRoot: flagSnapshot[i] & EntryFlags.root.rawValue != 0)
+                let d = NameIndex.derive(name: nameSnapshot.string(at: i), isRoot: flagSnapshot[i] & EntryFlags.root.rawValue != 0, cache: &cache)
                 chunk.folded.append(d.folded)
                 chunk.full.append(d.pinyinFull)
                 chunk.initials.append(d.pinyinInitials)
@@ -449,8 +451,9 @@ public final class NameIndex {
         let exactScore = 2000 * wordCount
         let candidateList = candidates ?? []
         let useCandidates = candidates != nil
+        let filter = constraints?.view
 
-        withExtendedLifetime(buffers) {
+        withExtendedLifetime((buffers, constraints)) {
             folded.withView { nameView in
             pinyinFull.withView { fullView in
             pinyinInitials.withView { initialsView in
@@ -470,6 +473,8 @@ public final class NameIndex {
                     var parentBytes: [UInt8] = []
                     var parentASCII = true
                     var pathBuffer: [UInt8] = []
+                    var pathParent: Int32 = -2
+                    var pathPrefixCount = 0
                     let start = chunk * chunkSize, end = min(total, start + chunkSize)
                     for position in start..<end {
                         let id = useCandidates ? Int(candidatePointer[position]) : position
@@ -479,21 +484,26 @@ public final class NameIndex {
                         let stem = UnsafeBufferPointer(rebasing: name[0..<min(name.count, Int(stemPointer[id]))])
 
                         // ext:, "phrase" and -exclusion filters (3.2 acceptsURL).
-                        if let constraints {
+                        if let filter {
                             let isFolder = flag & directoryBit != 0 && flag & packageBit == 0
-                            if !constraints.acceptsExtension(name: name, isFolder: isFolder) { continue }
-                            if constraints.filtersText {
+                            if !filter.acceptsExtension(name: name, isFolder: isFolder) { continue }
+                            if filter.filtersText {
                                 let accepted: Bool
-                                if constraints.usesPath {
+                                if filter.usesPath {
                                     let parent = parentPointer[id]
-                                    let base = folderPaths[parent] ?? []
-                                    pathBuffer.removeAll(keepingCapacity: true)
-                                    pathBuffer.append(contentsOf: base)
-                                    if base != [0x2F] { pathBuffer.append(0x2F) }
+                                    if parent != pathParent {
+                                        pathParent = parent
+                                        let base = folderPaths[parent] ?? []
+                                        pathBuffer.removeAll(keepingCapacity: true)
+                                        pathBuffer.append(contentsOf: base)
+                                        if base != [0x2F] { pathBuffer.append(0x2F) }
+                                        pathPrefixCount = pathBuffer.count
+                                    }
+                                    pathBuffer.removeSubrange(pathPrefixCount...)
                                     pathBuffer.append(contentsOf: name)
-                                    accepted = pathBuffer.withUnsafeBufferPointer { constraints.acceptsText($0) }
+                                    accepted = pathBuffer.withUnsafeBufferPointer { filter.acceptsText($0) }
                                 } else {
-                                    accepted = constraints.acceptsText(name)
+                                    accepted = filter.acceptsText(name)
                                 }
                                 if !accepted { continue }
                             }
@@ -550,7 +560,7 @@ public final class NameIndex {
                             if matched { base = score }
                         }
                         guard var score = base else { continue }
-                        if let constraints { score += constraints.phraseBonus(name: name, stem: stem) }
+                        if let filter { score += filter.phraseBonus(name: name, stem: stem) }
                         hits.append(SearchHit(id: Int32(id), score: score))
                     }
                     output[chunk] = hits
@@ -568,54 +578,97 @@ public final class NameIndex {
     }
 }
 
-/// Byte forms of a query's ext:, phrase and exclusion filters.
+/// Byte forms of a query's ext:, phrase and exclusion filters. Owns the memory;
+/// the search loop reads the plain `view`, which holds only raw pointers, so
+/// worker threads never touch shared reference counts.
 final class QueryConstraints {
-    let extensions: [[UInt8]]
-    let excludedExtensions: [[UInt8]]
-    let phrases: [[UInt8]]
-    let excluded: [[UInt8]]
-    /// Name-and-path mode checks phrases and exclusions against the whole path.
-    let usesPath: Bool
+    private let storage: [UnsafeMutableBufferPointer<UInt8>]
+    private let lists: [UnsafeMutableBufferPointer<UnsafeBufferPointer<UInt8>>]
+    let view: ConstraintView
 
     init(query: SearchQuery, precision: MatchPrecision) {
-        extensions = query.extensions.sorted().map { Array(("." + $0).utf8) }
-        excludedExtensions = query.excludedExtensions.sorted().map { Array(("." + $0).utf8) }
-        phrases = query.phrases.map { Array(SearchText.fold($0).utf8) }
-        excluded = query.excluded.map { Array(SearchText.fold($0).utf8) }
-        usesPath = precision == .withPath
+        var storage: [UnsafeMutableBufferPointer<UInt8>] = []
+        var lists: [UnsafeMutableBufferPointer<UnsafeBufferPointer<UInt8>>] = []
+        func list(_ items: [[UInt8]]) -> ByteList {
+            let pointers = UnsafeMutableBufferPointer<UnsafeBufferPointer<UInt8>>.allocate(capacity: max(1, items.count))
+            for (i, item) in items.enumerated() {
+                let buffer = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: max(1, item.count))
+                _ = buffer.initialize(from: item)
+                storage.append(buffer)
+                pointers[i] = UnsafeBufferPointer(rebasing: buffer[0..<item.count])
+            }
+            lists.append(pointers)
+            return ByteList(items: UnsafeBufferPointer(rebasing: pointers[0..<items.count]))
+        }
+        view = ConstraintView(
+            extensions: list(query.extensions.sorted().map { Array(("." + $0).utf8) }),
+            excludedExtensions: list(query.excludedExtensions.sorted().map { Array(("." + $0).utf8) }),
+            phrases: list(query.phrases.map { Array(SearchText.fold($0).utf8) }),
+            excluded: list(query.excluded.map { Array(SearchText.fold($0).utf8) }),
+            usesPath: precision == .withPath
+        )
+        self.storage = storage
+        self.lists = lists
     }
+
+    deinit {
+        for buffer in storage { buffer.deallocate() }
+        for list in lists { list.deallocate() }
+    }
+}
+
+struct ByteList {
+    let items: UnsafeBufferPointer<UnsafeBufferPointer<UInt8>>
+    var isEmpty: Bool { items.isEmpty }
+}
+
+struct ConstraintView {
+    let extensions: ByteList
+    let excludedExtensions: ByteList
+    let phrases: ByteList
+    let excluded: ByteList
+    /// Name-and-path mode checks phrases and exclusions against the whole path.
+    let usesPath: Bool
 
     var filtersText: Bool { !phrases.isEmpty || !excluded.isEmpty }
 
     /// 3.2: a folder passes only when no positive extension is required.
+    @inline(__always)
     func acceptsExtension(name: UnsafeBufferPointer<UInt8>, isFolder: Bool) -> Bool {
         if extensions.isEmpty && excludedExtensions.isEmpty { return true }
         if isFolder { return extensions.isEmpty }
-        if !extensions.isEmpty && !extensions.contains(where: { Self.hasSuffix(name, $0) }) { return false }
-        return !excludedExtensions.contains { Self.hasSuffix(name, $0) }
+        if !extensions.isEmpty {
+            var found = false
+            for suffix in extensions.items where Self.hasSuffix(name, suffix) { found = true; break }
+            if !found { return false }
+        }
+        for suffix in excludedExtensions.items where Self.hasSuffix(name, suffix) { return false }
+        return true
     }
 
+    @inline(__always)
     func acceptsText(_ haystack: UnsafeBufferPointer<UInt8>) -> Bool {
-        phrases.allSatisfy { Self.contains(haystack, $0) } && !excluded.contains { Self.contains(haystack, $0) }
+        for phrase in phrases.items where ByteMatch.firstIndex(of: phrase, in: haystack) == nil { return false }
+        for term in excluded.items where ByteMatch.firstIndex(of: term, in: haystack) != nil { return false }
+        return true
     }
 
     /// 3.2: +2000 when a phrase is the whole name, +1000 inside the name, +400 elsewhere in the path.
+    @inline(__always)
     func phraseBonus(name: UnsafeBufferPointer<UInt8>, stem: UnsafeBufferPointer<UInt8>) -> Int {
         var bonus = 0
-        for phrase in phrases {
-            let whole = phrase.withUnsafeBufferPointer { ByteMatch.equals(name, $0) || ByteMatch.equals(stem, $0) }
-            bonus += whole ? 2000 : (Self.contains(name, phrase) ? 1000 : 400)
+        for phrase in phrases.items {
+            if ByteMatch.equals(name, phrase) || ByteMatch.equals(stem, phrase) { bonus += 2000 }
+            else if ByteMatch.firstIndex(of: phrase, in: name) != nil { bonus += 1000 }
+            else { bonus += 400 }
         }
         return bonus
     }
 
-    static func contains(_ text: UnsafeBufferPointer<UInt8>, _ pattern: [UInt8]) -> Bool {
-        pattern.withUnsafeBufferPointer { ByteMatch.firstIndex(of: $0, in: text) != nil }
-    }
-
-    static func hasSuffix(_ text: UnsafeBufferPointer<UInt8>, _ suffix: [UInt8]) -> Bool {
+    @inline(__always)
+    static func hasSuffix(_ text: UnsafeBufferPointer<UInt8>, _ suffix: UnsafeBufferPointer<UInt8>) -> Bool {
         guard suffix.count <= text.count else { return false }
-        return suffix.withUnsafeBufferPointer { ByteMatch.equals(UnsafeBufferPointer(rebasing: text[(text.count - $0.count)...]), $0) }
+        return ByteMatch.equals(UnsafeBufferPointer(rebasing: text[(text.count - suffix.count)...]), suffix)
     }
 }
 

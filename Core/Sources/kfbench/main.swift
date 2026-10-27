@@ -103,6 +103,14 @@ case "new":
     report("new.typing.session.ms", format(typedWithSession))
     report("new.typing.full.ms", format(typedWithout))
 
+    let stems = index.liveEntryIDs().map { (index.name(of: $0) as NSString).deletingPathExtension }
+    let (check, checkTime) = milliseconds { Pinyin.verifyFastPath(stems) }
+    report("new.pinyin.names", check.namesWithCJK)
+    report("new.pinyin.slowPath", check.slowPathNames)
+    report("new.pinyin.mismatches", check.mismatches.count)
+    for line in check.mismatches.prefix(10) { report("new.pinyin.mismatch", line) }
+    report("new.pinyin.check.ms", format(checkTime))
+
     let standard = NameIndex.build(roots: [root], rules: .standard(home: root))
     report("new.standardRules.entries", standard.entryCount)
 
