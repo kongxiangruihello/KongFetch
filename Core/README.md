@@ -28,7 +28,7 @@ swift run -c release kfbench new /tmp/tree     # 新引擎
 swift run -c release kfbench legacy /tmp/tree  # 3.2 对照
 ```
 
-`scripts/mac-test.sh test|bench` 会拉取本分支最新代码并把输出写入 `Core/.logs/`。
+`scripts/mac-test.sh test|bench|all` 在 Mac 上编译、测试或运行基准，输出写入 `Core/.logs/`（脚本不联网，代码需另行同步）。
 
 ## 首轮实测（2026-10-27）
 
