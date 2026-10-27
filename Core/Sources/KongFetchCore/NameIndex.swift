@@ -239,7 +239,7 @@ public final class NameIndex {
 
     /// Search keys for one name: folded name, folded length of the name without
     /// extension (3.2 compares both against the whole query), and pinyin forms.
-    static func derive(name: String, isRoot: Bool, cache: inout Pinyin.SyllableCache) -> Derived {
+    static func derive(name: String, isRoot: Bool, cache: inout Pinyin.RunCache) -> Derived {
         let foldedName = SearchText.fold(name)
         let foldedCount = foldedName.utf8.count
         var stemLength = foldedCount
@@ -266,7 +266,7 @@ public final class NameIndex {
 
     private func appendDerived(for id: Int32) {
         let i = Int(id)
-        var cache = Pinyin.SyllableCache()
+        var cache = Pinyin.RunCache()
         let derived = Self.derive(name: names.string(at: i), isRoot: flags[i] & EntryFlags.root.rawValue != 0, cache: &cache)
         folded.append(derived.folded)
         pinyinFull.append(derived.pinyinFull)
@@ -306,7 +306,7 @@ public final class NameIndex {
             let chunk = chunks[c]
             let start = c * chunkSize, end = min(total, start + chunkSize)
             guard start < end else { return }
-            var cache = Pinyin.SyllableCache()
+            var cache = Pinyin.RunCache()
             for i in start..<end {
                 let d = NameIndex.derive(name: nameSnapshot.string(at: i), isRoot: flagSnapshot[i] & EntryFlags.root.rawValue != 0, cache: &cache)
                 chunk.folded.append(d.folded)
